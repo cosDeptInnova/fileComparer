@@ -26,6 +26,7 @@
       LaunchMode="uvicorn";
       Args=@("app.app:app","--reload","--host","0.0.0.0","--port","8007");
       CompanionServices=@("comp_docs_worker");
+      CompanionStartOrder="before";
       Env=@{
         COMPARE_REQUIRE_ACTIVE_WORKERS="true"
       };
@@ -87,6 +88,6 @@
 
   StartOrder = @(
     "auth_sso","login","cosmos_mcp","nlp","ocr",
-    "legal_search","web_search","chat_document","comp_docs","comp_docs_worker","modeloNegocio"
+    "legal_search","web_search","chat_document","comp_docs_worker","comp_docs","modeloNegocio"
   )
 }
