@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from app.extractors import ExtractionResult
+from app.llm_client import LLMResponseError
 from app.schemas import LLMComparisonResponse
 from app.services import comparison_pipeline
 from app.services.segmenter import TextBlock
@@ -59,7 +60,7 @@ class FailingPairStubLLMClient(PairingStubLLMClient):
         user_payload = messages[-1]["content"]
         if '"rows"' in user_payload:
             return super().compare(messages)
-        if '"index": 1' in user_payload and "NUEVO intermedio" in user_payload:
+        if '"index": 1' in user_payload and "Y ajustado" in user_payload:
             raise RuntimeError("fallo controlado en pareja intermedia")
         return super().compare(messages)
 
@@ -70,6 +71,14 @@ class ReconciliationFailingStubLLMClient(PairingStubLLMClient):
         if '"rows"' in user_payload:
             raise RuntimeError("fallo controlado en reconciliación")
         return super().compare(messages)
+
+
+class EmptyPayloadFallbackStubLLMClient(PairingStubLLMClient):
+    def compare(self, messages):
+        user_payload = messages[-1]["content"]
+        if '"rows"' in user_payload:
+            return LLMComparisonResponse.model_validate({"changes": []})
+        raise LLMResponseError("Payload del LLM vacío.")
 
 
 def make_block(index: int, text: str) -> TextBlock:
@@ -187,14 +196,16 @@ def test_compare_documents_reports_pairing_counters_and_row_pair_types(monkeypat
         "orphan_b": 1,
         "reanchored_pairs": 1,
     }
-    assert [row.pairing["pair_type"] for row in result.rows] == ["matched", "orphan_b", "reanchored"]
+    assert [row.pairing["pair_type"] for row in result.rows] == ["orphan_b"]
+    assert result.rows[0].change_type == "añadido"
+    assert result.meta["diagnostics"]["fallback_blocks"] == 0
 
 
 def test_compare_documents_keeps_partial_result_when_pair_fails(monkeypatch, tmp_path: Path):
     file_a = tmp_path / "a.txt"
     file_b = tmp_path / "b.txt"
     file_a.write_text("X\nY", encoding="utf-8")
-    file_b.write_text("X\nNUEVO intermedio\nY", encoding="utf-8")
+    file_b.write_text("X\nY ajustado", encoding="utf-8")
 
     def fake_extract_document_result(path: str, *, soffice_path=None, drop_headers=True, engine="auto"):
         text = Path(path).read_text(encoding="utf-8")
@@ -219,7 +230,6 @@ def test_compare_documents_keeps_partial_result_when_pair_fails(monkeypatch, tmp
 
     result = comparison_pipeline.compare_documents(file_a, file_b, sid="sid-partial", llm_client=FailingPairStubLLMClient())
 
-    assert result.rows
     assert result.status == "done_with_warnings"
     assert result.meta["partial_result"] is True
     assert result.meta["cache"]["failed_blocks"] == 1
@@ -231,14 +241,14 @@ def test_compare_documents_keeps_partial_result_when_pair_fails(monkeypatch, tmp
             "message": "fallo controlado en pareja intermedia",
         }
     ]
-    assert [row.pair_id for row in result.rows] == ["sid-partial-1", "sid-partial-3"]
+    assert [row.pair_id for row in result.rows] == []
 
 
 def test_compare_documents_keeps_original_rows_when_reconciliation_fails(monkeypatch, tmp_path: Path):
     file_a = tmp_path / "a.txt"
     file_b = tmp_path / "b.txt"
-    file_a.write_text("X\nY", encoding="utf-8")
-    file_b.write_text("X\nNUEVO\nY", encoding="utf-8")
+    file_a.write_text("X base\nY base", encoding="utf-8")
+    file_b.write_text("X cambiado\nY cambiado", encoding="utf-8")
 
     def fake_extract_document_result(path: str, *, soffice_path=None, drop_headers=True, engine="auto"):
         text = Path(path).read_text(encoding="utf-8")
@@ -268,7 +278,7 @@ def test_compare_documents_keeps_original_rows_when_reconciliation_fails(monkeyp
     )
 
     assert result.rows
-    assert [row.pair_id for row in result.rows] == ["sid-reconcile-1", "sid-reconcile-2", "sid-reconcile-3"]
+    assert [row.pair_id for row in result.rows] == ["sid-reconcile-1", "sid-reconcile-2"]
     assert result.meta["diagnostics"]["reconciliation_failed"] is True
     assert result.meta["diagnostics"]["errors"] == [
         {
@@ -276,5 +286,52 @@ def test_compare_documents_keeps_original_rows_when_reconciliation_fails(monkeyp
             "stage": "reconcile",
             "error_type": "RuntimeError",
             "message": "fallo controlado en reconciliación",
+        }
+    ]
+
+
+def test_compare_documents_uses_local_fallback_when_llm_returns_empty_payload(monkeypatch, tmp_path: Path):
+    file_a = tmp_path / "a.txt"
+    file_b = tmp_path / "b.txt"
+    file_a.write_text("Texto original", encoding="utf-8")
+    file_b.write_text("Texto actualizado", encoding="utf-8")
+
+    def fake_extract_document_result(path: str, *, soffice_path=None, drop_headers=True, engine="auto"):
+        text = Path(path).read_text(encoding="utf-8")
+        return ExtractionResult(
+            text=text,
+            engine="builtin",
+            quality_score=0.95,
+            metadata={
+                "source_format": "txt",
+                "source_format_real": "txt",
+                "conversion": {"applied": False},
+                "engine_used": "builtin",
+            },
+            blocks=[],
+            quality_signals={"block_count": 0},
+        )
+
+    monkeypatch.setattr(comparison_pipeline, "extract_document_result", fake_extract_document_result)
+    monkeypatch.setattr(comparison_pipeline, "normalize_text", lambda text: text)
+    monkeypatch.setattr(comparison_pipeline, "build_blocks", lambda text, *_args: [make_block(i, part) for i, part in enumerate(text.splitlines()) if part])
+
+    result = comparison_pipeline.compare_documents(
+        file_a,
+        file_b,
+        sid="sid-fallback",
+        llm_client=EmptyPayloadFallbackStubLLMClient(),
+    )
+
+    assert result.status == "done_with_warnings"
+    assert len(result.rows) == 1
+    assert result.rows[0].change_type == "modificado"
+    assert result.meta["diagnostics"]["fallback_blocks"] == 1
+    assert result.meta["diagnostics"]["errors"] == [
+        {
+            "pair_id": "sid-fallback-1",
+            "stage": "compare_pair_fallback",
+            "error_type": "LLMResponseError",
+            "message": "Payload del LLM vacío.",
         }
     ]

@@ -20,7 +20,11 @@ class FakeHttpClient:
 
     def post(self, path, json):
         self.calls.append((path, json))
-        return FakeResponse(self.payload)
+        if isinstance(self.payload, list):
+            current = self.payload.pop(0)
+        else:
+            current = self.payload
+        return FakeResponse(current)
 
     def close(self):
         return None
@@ -57,3 +61,53 @@ def test_llm_client_compare_returns_validated_response():
     ])
     assert isinstance(result, LLMComparisonResponse)
     assert result.changes[0].change_type == "añadido"
+
+
+def test_extract_json_message_reads_tool_call_arguments_when_content_is_empty():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "arguments": '{"changes":[{"change_type":"eliminado","source_a":"viejo","source_b":""}]}'
+                            }
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    data = _extract_json_message(payload)
+
+    assert data["changes"][0]["change_type"] == "eliminado"
+
+
+def test_llm_client_compare_retries_without_response_format_when_content_is_empty():
+    payloads = [
+        {"choices": [{"message": {"content": ""}}]},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"changes":[{"change_type":"modificado","source_a":"A","source_b":"B"}]}'
+                    }
+                }
+            ]
+        },
+    ]
+    fake_http_client = FakeHttpClient(payloads)
+    client = LLMClient(client=fake_http_client, max_retries=1)
+
+    result = client.compare([
+        {"role": "system", "content": "x"},
+        {"role": "user", "content": "y"},
+    ])
+
+    assert result.changes[0].change_type == "modificado"
+    assert len(fake_http_client.calls) == 2
+    assert fake_http_client.calls[0][1]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in fake_http_client.calls[1][1]

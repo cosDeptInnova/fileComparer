@@ -23,6 +23,7 @@ from app.schemas import LLMComparisonResponse
 logger = logging.getLogger(__name__)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 JSON_INLINE_RE = re.compile(r"(\{.*\})", re.DOTALL)
+EMPTY_PAYLOAD_ERROR = "Payload del LLM vacío."
 
 
 class LLMResponseError(RuntimeError):
@@ -52,35 +53,67 @@ class LLMClient:
             self.client.close()
             self.client = None
 
-    def _build_payload(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        enforce_json_response: bool = True,
+    ) -> dict[str, Any]:
         prompt_chars = sum(len(message.get("content", "")) for message in messages)
         if prompt_chars > settings.context_window_chars:
             raise LLMResponseError(
                 f"Prompt excede ventana máxima local de {settings.context_window_chars} caracteres."
             )
-        return {
+        payload = {
             "model": self.model_name,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "response_format": {"type": "json_object"},
         }
+        if enforce_json_response:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     def compare(self, messages: list[dict[str, str]]) -> LLMComparisonResponse:
-        payload = self._build_payload(messages)
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
-            try:
-                logger.info("Llamando llama.cpp intento=%s model=%s", attempt, self.model_name)
-                response = self._http_client().post("chat/completions", json=payload)
-                response.raise_for_status()
-                parsed = _extract_json_message(response.json())
-                return LLMComparisonResponse.model_validate(parsed)
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                logger.warning(
-                    "Fallo comparando con llama.cpp intento=%s error=%s", attempt, exc
-                )
+            retry_without_format = False
+            attempt_succeeded = False
+            for mode_name, enforce_json_response in (
+                ("json_object", True),
+                ("prompt_only_json", False),
+            ):
+                if mode_name == "prompt_only_json" and not retry_without_format:
+                    continue
+                try:
+                    payload = self._build_payload(
+                        messages,
+                        enforce_json_response=enforce_json_response,
+                    )
+                    logger.info(
+                        "Llamando llama.cpp intento=%s model=%s mode=%s",
+                        attempt,
+                        self.model_name,
+                        mode_name,
+                    )
+                    response = self._http_client().post("chat/completions", json=payload)
+                    response.raise_for_status()
+                    parsed = _extract_json_message(response.json())
+                    attempt_succeeded = True
+                    return LLMComparisonResponse.model_validate(parsed)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    logger.warning(
+                        "Fallo comparando con llama.cpp intento=%s mode=%s error=%s",
+                        attempt,
+                        mode_name,
+                        exc,
+                    )
+                    if enforce_json_response and _should_retry_without_response_format(exc):
+                        retry_without_format = True
+                        continue
+                    break
+            if not attempt_succeeded and attempt < self.max_retries:
                 time.sleep(min(0.7 * attempt, 2.0))
         raise LLMResponseError(
             f"No se pudo obtener una respuesta JSON válida del LLM: {last_error}"
@@ -91,17 +124,37 @@ def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
     choices = payload.get("choices") or []
     if not choices:
         raise LLMResponseError("Payload sin choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
+    choice = choices[0]
+    message = choice.get("message") or {}
+    content = message.get("content")
     if isinstance(content, list):
-        content = "".join(
-            str(item.get("text", "")) for item in content if isinstance(item, dict)
-        )
+        text_parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_text = item.get("text")
+            if isinstance(item_text, str) and item_text.strip():
+                text_parts.append(item_text)
+                continue
+            item_json = item.get("json")
+            if isinstance(item_json, dict):
+                return item_json
+            if isinstance(item_json, str) and item_json.strip():
+                text_parts.append(item_json)
+        content = "".join(text_parts)
     if isinstance(content, dict):
         return content
-    text = str(content or "").strip()
+    if content is None:
+        content = choice.get("text")
+
+    text_fragments = [str(content or "").strip()]
+    reasoning_content = message.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content.strip():
+        text_fragments.append(reasoning_content.strip())
+    text_fragments.extend(_tool_call_candidates(message))
+    text = "\n".join(fragment for fragment in text_fragments if fragment).strip()
     if not text:
-        raise LLMResponseError("Payload del LLM vacío.")
+        raise LLMResponseError(EMPTY_PAYLOAD_ERROR)
     for candidate in _json_candidates(text):
         try:
             data = json.loads(candidate)
@@ -112,6 +165,29 @@ def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             continue
     raise LLMResponseError("No se pudo extraer JSON estricto del mensaje del LLM.")
+
+
+def _tool_call_candidates(message: dict[str, Any]) -> list[str]:
+    tool_calls = message.get("tool_calls") or []
+    candidates: list[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function_payload = tool_call.get("function") or {}
+        arguments = function_payload.get("arguments")
+        if isinstance(arguments, str) and arguments.strip():
+            candidates.append(arguments.strip())
+    return candidates
+
+
+def _should_retry_without_response_format(exc: Exception) -> bool:
+    if not isinstance(exc, LLMResponseError):
+        return False
+    message = str(exc)
+    return message in {
+        EMPTY_PAYLOAD_ERROR,
+        "No se pudo extraer JSON estricto del mensaje del LLM.",
+    }
 
 
 def _json_candidates(text: str) -> list[str]:

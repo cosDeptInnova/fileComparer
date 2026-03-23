@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from app.extractors import extract_document_result
-from app.llm_client import LLMClient
-from app.schemas import ChangeRow, ComparisonResult, ExtractedDocument
+from app.llm_client import LLMClient, LLMResponseError
+from app.schemas import ChangeRow, ComparisonResult, ExtractedDocument, LLMComparisonResponse
 from app.services.normalization import normalize_text
 from app.services.postprocess import build_reconciliation_payload, merge_reconciled_rows
 from app.services.segmenter import TextBlock, build_blocks
@@ -196,6 +196,8 @@ No añadas comentarios narrativos.
 Devuelve JSON estricto con la misma forma {\"changes\":[...]}.
 Si todos los hallazgos ya son consistentes, devuelve los mismos sin duplicados."""
 
+PAIR_PROMPT_CHAR_LIMIT = 2200
+
 
 def _safe_error_message(exc: Exception) -> str:
     message = str(exc).strip()
@@ -211,26 +213,135 @@ def _build_error_summary(*, pair_id: str, stage: str, exc: Exception) -> dict[st
     }
 
 
-def _resolve_result_status(*, failed_blocks: int, total_pairs: int) -> str:
+def _resolve_result_status(*, failed_blocks: int, total_pairs: int, fallback_blocks: int = 0) -> str:
     if total_pairs <= 0:
         return "done"
     failed_ratio = failed_blocks / total_pairs
-    if failed_blocks <= 0:
+    if failed_blocks <= 0 and fallback_blocks <= 0:
         return "done"
     if failed_ratio >= settings.compare_failed_blocks_error_ratio:
         return "error"
     return "done_with_warnings"
 
 
-def _comparison_messages(block_a: TextBlock | None, block_b: TextBlock | None) -> list[dict[str, str]]:
+def _excerpt_for_prompt(text: str, *, limit: int = PAIR_PROMPT_CHAR_LIMIT) -> tuple[str, bool]:
+    clean = (text or "").strip()
+    if len(clean) <= limit:
+        return clean, False
+    head = max(200, limit // 2)
+    tail = max(120, limit - head - 32)
+    excerpt = f"{clean[:head].rstrip()}\n[…texto truncado…]\n{clean[-tail:].lstrip()}"
+    return excerpt, True
+
+
+def _heuristic_compare_pair(block_a: TextBlock | None, block_b: TextBlock | None) -> tuple[LLMComparisonResponse, str] | None:
+    text_a = "" if block_a is None else block_a.text.strip()
+    text_b = "" if block_b is None else block_b.text.strip()
+    if not text_a and not text_b:
+        return LLMComparisonResponse.model_validate({"changes": []}), "empty_pair"
+    if block_a is None and text_b:
+        return (
+            LLMComparisonResponse.model_validate(
+                {
+                    "changes": [
+                        {
+                            "change_type": "añadido",
+                            "source_a": "",
+                            "source_b": text_b,
+                            "summary": "Bloque presente solo en el documento B.",
+                            "confidence": "alta",
+                            "severity": "media",
+                            "evidence": "Fallback heurístico: bloque huérfano en B.",
+                            "anchor_a": None,
+                            "anchor_b": block_b.index if block_b is not None else None,
+                        }
+                    ]
+                }
+            ),
+            "orphan_b",
+        )
+    if block_b is None and text_a:
+        return (
+            LLMComparisonResponse.model_validate(
+                {
+                    "changes": [
+                        {
+                            "change_type": "eliminado",
+                            "source_a": text_a,
+                            "source_b": "",
+                            "summary": "Bloque presente solo en el documento A.",
+                            "confidence": "alta",
+                            "severity": "media",
+                            "evidence": "Fallback heurístico: bloque huérfano en A.",
+                            "anchor_a": block_a.index if block_a is not None else None,
+                            "anchor_b": None,
+                        }
+                    ]
+                }
+            ),
+            "orphan_a",
+        )
+    if normalize_text(text_a) == normalize_text(text_b):
+        return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
+    return None
+
+
+def _llm_fallback_compare_pair(block_a: TextBlock | None, block_b: TextBlock | None) -> LLMComparisonResponse:
+    text_a = "" if block_a is None else block_a.text.strip()
+    text_b = "" if block_b is None else block_b.text.strip()
+    if normalize_text(text_a) == normalize_text(text_b):
+        return LLMComparisonResponse.model_validate({"changes": []})
+    change_type = "modificado"
+    if not text_a and text_b:
+        change_type = "añadido"
+    elif text_a and not text_b:
+        change_type = "eliminado"
+    return LLMComparisonResponse.model_validate(
+        {
+            "changes": [
+                {
+                    "change_type": change_type,
+                    "source_a": text_a,
+                    "source_b": text_b,
+                    "summary": "Cambio detectado mediante fallback local al no obtener JSON válido del LLM.",
+                    "confidence": "baja",
+                    "severity": "media",
+                    "evidence": "Fallback local por respuesta vacía o no estructurada del modelo.",
+                    "anchor_a": None if block_a is None else block_a.index,
+                    "anchor_b": None if block_b is None else block_b.index,
+                }
+            ]
+        }
+    )
+
+
+def _comparison_messages(
+    block_a: TextBlock | None,
+    block_b: TextBlock | None,
+    *,
+    pair_type: str,
+    alignment_score: float,
+) -> list[dict[str, str]]:
+    text_a, truncated_a = _excerpt_for_prompt("" if block_a is None else block_a.text)
+    text_b, truncated_b = _excerpt_for_prompt("" if block_b is None else block_b.text)
     payload = {
+        "comparison_rules": {
+            "pair_type": pair_type,
+            "alignment_score": round(alignment_score, 4),
+            "ignore_formatting_noise": True,
+            "report_only_real_semantic_changes": True,
+        },
         "block_a": {
             "index": None if block_a is None else block_a.index,
-            "text": "" if block_a is None else block_a.text,
+            "text": text_a,
+            "char_count": 0 if block_a is None else len(block_a.text),
+            "truncated": truncated_a,
         },
         "block_b": {
             "index": None if block_b is None else block_b.index,
-            "text": "" if block_b is None else block_b.text,
+            "text": text_b,
+            "char_count": 0 if block_b is None else len(block_b.text),
+            "truncated": truncated_b,
         },
     }
     return [
@@ -274,6 +385,10 @@ def compare_documents(
         rows: list[ChangeRow] = []
         diagnostics_errors: list[dict[str, str]] = []
         failed_blocks = 0
+        fallback_blocks = 0
+        llm_generated_rows = 0
+        fallback_generated_rows = 0
+        heuristic_generated_rows = 0
         compared_pairs = 0
         threshold_reached = False
         for index, pair in enumerate(pairs, start=1):
@@ -281,16 +396,44 @@ def compare_documents(
             block_a = pair["a"]
             block_b = pair["b"]
             pair_id = f"{sid}-{index}"
-            try:
-                llm_response = client.compare(_comparison_messages(block_a, block_b))
-            except Exception as exc:  # noqa: BLE001
-                failed_blocks += 1
-                diagnostics_errors.append(_build_error_summary(pair_id=pair_id, stage="compare_pair", exc=exc))
-                logger.exception("Error comparando pareja %s", pair_id)
-                if failed_blocks > failure_threshold:
-                    threshold_reached = True
-                    break
-                continue
+            heuristic_result = _heuristic_compare_pair(block_a, block_b)
+            if heuristic_result is not None:
+                llm_response, heuristic_mode = heuristic_result
+                row_source = "heuristic"
+                if heuristic_mode != "normalized_equal":
+                    logger.info("Pareja %s resuelta sin LLM usando heurística=%s", pair_id, heuristic_mode)
+            else:
+                try:
+                    llm_response = client.compare(
+                        _comparison_messages(
+                            block_a,
+                            block_b,
+                            pair_type=pair["pair_type"],
+                            alignment_score=pair["alignment_score"],
+                        )
+                    )
+                    row_source = "llm"
+                except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, LLMResponseError):
+                        fallback_blocks += 1
+                        diagnostics_errors.append(
+                            _build_error_summary(pair_id=pair_id, stage="compare_pair_fallback", exc=exc)
+                        )
+                        logger.warning(
+                            "Usando fallback local para pareja %s tras fallo del LLM: %s",
+                            pair_id,
+                            exc,
+                        )
+                        llm_response = _llm_fallback_compare_pair(block_a, block_b)
+                        row_source = "fallback"
+                    else:
+                        failed_blocks += 1
+                        diagnostics_errors.append(_build_error_summary(pair_id=pair_id, stage="compare_pair", exc=exc))
+                        logger.exception("Error comparando pareja %s", pair_id)
+                        if failed_blocks > failure_threshold:
+                            threshold_reached = True
+                            break
+                        continue
             for change in llm_response.changes:
                 rows.append(
                     ChangeRow(
@@ -324,6 +467,12 @@ def compare_documents(
                         },
                     )
                 )
+                if row_source == "llm":
+                    llm_generated_rows += 1
+                elif row_source == "fallback":
+                    fallback_generated_rows += 1
+                else:
+                    heuristic_generated_rows += 1
         valid_rows_for_reconciliation = len(rows) >= settings.compare_reconcile_min_rows
         reconciled = None
         reconciliation_used = False
@@ -340,10 +489,15 @@ def compare_documents(
                 logger.exception("Error reconciliando resultado %s", sid)
         final_rows = merge_reconciled_rows(rows, reconciled)
         failed_ratio = (failed_blocks / len(pairs)) if pairs else 0.0
-        partial_result = failed_blocks > 0 or threshold_reached or reconciliation_failed
-        status = _resolve_result_status(failed_blocks=failed_blocks, total_pairs=len(pairs))
+        partial_result = failed_blocks > 0 or fallback_blocks > 0 or threshold_reached or reconciliation_failed
+        status = _resolve_result_status(
+            failed_blocks=failed_blocks,
+            total_pairs=len(pairs),
+            fallback_blocks=fallback_blocks,
+        )
         error_summary = {
             "failed_blocks": failed_blocks,
+            "fallback_blocks": fallback_blocks,
             "total_pairs": len(pairs),
             "failed_ratio": failed_ratio,
             "threshold": failure_threshold,
@@ -354,6 +508,13 @@ def compare_documents(
             "valid_rows_before_reconciliation": len(rows),
             "errors": diagnostics_errors,
         }
+        warning_details: list[str] = []
+        if failed_blocks > 0:
+            warning_details.append(f"{failed_blocks} de {len(pairs)} bloques fallidos")
+        if fallback_blocks > 0:
+            warning_details.append(f"{fallback_blocks} bloques resueltos con fallback local")
+        if reconciliation_failed:
+            warning_details.append("reconciliación final no disponible")
         return ComparisonResult(
             sid=sid,
             status=status,
@@ -368,13 +529,14 @@ def compare_documents(
                 "completed_pairs": compared_pairs,
                 "total_pairs": len(pairs),
                 "failed_blocks": failed_blocks,
+                "fallback_blocks": fallback_blocks,
             },
             rows=final_rows,
             ok=status != "error",
             error=(
                 None
                 if status == "done"
-                else f"Resultado parcial: {failed_blocks} de {len(pairs)} bloques fallidos"
+                else f"Resultado parcial: {'; '.join(warning_details) if warning_details else 'se detectaron advertencias'}"
             ),
             meta={
                 "pagination": {
@@ -394,8 +556,11 @@ def compare_documents(
                 "cache": {
                     "policy": "no-store",
                     "resolved_from_cache": 0,
-                    "resolved_by_llm": len(final_rows),
+                    "resolved_by_llm": llm_generated_rows,
+                    "resolved_by_fallback": fallback_generated_rows,
+                    "resolved_by_heuristic": heuristic_generated_rows,
                     "failed_blocks": failed_blocks,
+                    "fallback_blocks": fallback_blocks,
                     "block_size_words": 0,
                     "block_overlap_words": 0,
                     "model_name": client.model_name,
@@ -415,6 +580,7 @@ def compare_documents(
                 },
                 "diagnostics": {
                     "failed_blocks": failed_blocks,
+                    "fallback_blocks": fallback_blocks,
                     "compared_pairs": compared_pairs,
                     "total_pairs": len(pairs),
                     "failed_ratio": failed_ratio,
@@ -435,5 +601,5 @@ def compare_documents(
             },
         )
     finally:
-        if owns_client:
+        if owns_client and hasattr(client, "close"):
             client.close()
