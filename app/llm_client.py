@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from collections.abc import Callable
@@ -228,11 +229,18 @@ def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("llm_invalid_payload")
 
+    candidate_summaries: list[str] = []
     for candidate in _iter_json_candidates(payload):
+        candidate_summaries.append(_summarize_candidate(candidate))
         parsed = _parse_json_candidate(candidate)
         if isinstance(parsed, dict):
             return parsed
 
+    LOGGER.warning(
+        "LLM compare response did not contain valid JSON. payload_keys=%s candidates=%s",
+        sorted(payload.keys()),
+        candidate_summaries[:8],
+    )
     raise ValueError("llm_invalid_json")
 
 
@@ -279,6 +287,9 @@ def _iter_message_content_candidates(message: dict[str, Any]):
                 yield nested
     elif isinstance(content, (str, list)):
         yield content
+        joined_content = _join_text_fragments(content)
+        if joined_content:
+            yield joined_content
 
     tool_calls = message.get("tool_calls")
     if isinstance(tool_calls, list):
@@ -294,6 +305,14 @@ def _iter_message_content_candidates(message: dict[str, Any]):
 
 def _parse_json_candidate(candidate: Any) -> dict[str, Any] | None:
     if isinstance(candidate, dict):
+        direct_json = candidate.get("json")
+        if isinstance(direct_json, dict):
+            return direct_json
+        for key in ("arguments", "content", "text", "output", "input"):
+            nested = candidate.get(key)
+            parsed = _parse_json_candidate(nested)
+            if isinstance(parsed, dict):
+                return parsed
         return candidate
     if isinstance(candidate, list):
         for item in candidate:
@@ -310,6 +329,11 @@ def _parse_json_candidate(candidate: Any) -> dict[str, Any] | None:
                 parsed = _loads_maybe_embedded_json(item)
                 if isinstance(parsed, dict):
                     return parsed
+        joined = _join_text_fragments(candidate)
+        if joined:
+            parsed = _loads_maybe_embedded_json(joined)
+            if isinstance(parsed, dict):
+                return parsed
         return None
     if isinstance(candidate, str):
         return _loads_maybe_embedded_json(candidate)
@@ -318,7 +342,7 @@ def _parse_json_candidate(candidate: Any) -> dict[str, Any] | None:
 
 
 def _loads_maybe_embedded_json(raw: str) -> dict[str, Any] | None:
-    text = (raw or "").strip()
+    text = _strip_reasoning_markup(raw or "").strip()
     if not text:
         return None
 
@@ -338,6 +362,15 @@ def _loads_maybe_embedded_json(raw: str) -> dict[str, Any] | None:
         parsed = _try_json_loads(embedded)
         if isinstance(parsed, dict):
             return parsed
+    trailing_embedded = _extract_last_json_object(text)
+    if trailing_embedded and trailing_embedded != embedded:
+        parsed = _try_json_loads(trailing_embedded)
+        if isinstance(parsed, dict):
+            return parsed
+
+    literal = _try_python_dict_literal(text)
+    if isinstance(literal, dict):
+        return literal
     return None
 
 
@@ -346,6 +379,20 @@ def _try_json_loads(raw: str) -> dict[str, Any] | None:
     try:
         parsed = json.loads(raw)
     except JSONDecodeError:
+        return None
+    if isinstance(parsed, str):
+        nested = parsed.strip()
+        if nested and nested != raw:
+            reparsed = _try_json_loads(nested)
+            if isinstance(reparsed, dict):
+                return reparsed
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _try_python_dict_literal(raw: str) -> dict[str, Any] | None:
+    try:
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -367,27 +414,89 @@ def _strip_markdown_code_fence(text: str) -> str:
 def _extract_first_json_object(text: str) -> str | None:
     start = text.find("{")
     while start >= 0:
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-                continue
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : index + 1]
+        extracted = _extract_json_object_from_index(text, start)
+        if extracted:
+            return extracted
         start = text.find("{", start + 1)
     return None
+
+
+def _extract_last_json_object(text: str) -> str | None:
+    for start in range(len(text) - 1, -1, -1):
+        if text[start] != "{":
+            continue
+        extracted = _extract_json_object_from_index(text, start)
+        if extracted:
+            return extracted
+    return None
+
+
+def _extract_json_object_from_index(text: str, start: int) -> str | None:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _join_text_fragments(candidate: Any) -> str:
+    fragments: list[str] = []
+    _collect_text_fragments(candidate, fragments)
+    return "".join(fragments).strip()
+
+
+def _collect_text_fragments(candidate: Any, fragments: list[str]) -> None:
+    if isinstance(candidate, str):
+        fragments.append(candidate)
+        return
+    if isinstance(candidate, list):
+        for item in candidate:
+            _collect_text_fragments(item, fragments)
+        return
+    if not isinstance(candidate, dict):
+        return
+    for key in ("text", "content", "arguments", "output_text"):
+        value = candidate.get(key)
+        if isinstance(value, (str, list, dict)):
+            _collect_text_fragments(value, fragments)
+
+
+def _strip_reasoning_markup(text: str) -> str:
+    stripped = text.strip()
+    think_open = stripped.lower().find("<think>")
+    think_close = stripped.lower().rfind("</think>")
+    if think_open >= 0 and think_close > think_open:
+        without_think = (stripped[:think_open] + stripped[think_close + len("</think>") :]).strip()
+        if without_think:
+            return without_think
+    return stripped
+
+
+def _summarize_candidate(candidate: Any) -> str:
+    if isinstance(candidate, dict):
+        return f"dict(keys={sorted(candidate.keys())[:6]})"
+    if isinstance(candidate, list):
+        joined = _join_text_fragments(candidate)
+        return f"list(len={len(candidate)}, joined={joined[:120]!r})"
+    if isinstance(candidate, str):
+        compact = " ".join(candidate.split())
+        return f"str({compact[:120]!r})"
+    return type(candidate).__name__
