@@ -9,6 +9,7 @@ from typing import Any
 _STRUCTURAL_BREAK_TYPES = {"page_break", "section_break"}
 _TEXTUAL_TYPES = {"paragraph", "line", "list_item", "table_row", "header", "footer"}
 _NOISE_TYPES = {"header", "footer"}
+_PARAGRAPH_LIKE_TYPES = {"paragraph", "list_item", "table_row", "header", "footer"}
 
 
 @dataclass(slots=True)
@@ -52,6 +53,7 @@ class ExtractionLayout:
     def canonical_text(self) -> str:
         segments: list[str] = []
         pending_break = False
+        previous_block_type: str | None = None
 
         for block in self.canonical_blocks():
             if block.is_structural_break():
@@ -65,8 +67,15 @@ class ExtractionLayout:
 
             if pending_break and segments:
                 segments.append("")
+            elif (
+                segments
+                and previous_block_type in _PARAGRAPH_LIKE_TYPES
+                and block.block_type in _PARAGRAPH_LIKE_TYPES
+            ):
+                segments.append("")
             segments.append(normalized)
             pending_break = False
+            previous_block_type = block.block_type
 
         return "\n".join(segments).strip()
 

@@ -57,3 +57,15 @@ def test_quality_signals_report_table_density_and_repeated_headers():
     assert signals["has_repeated_headers"] is True
     assert signals["table_like_density"] > 0.0
     assert signals["avg_line_length"] > 0.0
+
+
+def test_canonical_text_inserts_paragraph_breaks_between_paragraph_like_blocks():
+    layout = ExtractionLayout(
+        source_engine="docx",
+        blocks=[
+            ExtractionBlock(text="PRIMERA.- OBJETO", page=None, block_type="paragraph", source_engine="docx"),
+            ExtractionBlock(text="SEGUNDA.- DESCRIPCIÓN", page=None, block_type="paragraph", source_engine="docx"),
+        ],
+    )
+
+    assert layout.canonical_text() == "PRIMERA.- OBJETO\n\nSEGUNDA.- DESCRIPCIÓN"

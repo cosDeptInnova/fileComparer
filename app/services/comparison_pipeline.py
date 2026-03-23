@@ -184,8 +184,11 @@ def _pair_blocks(blocks_a: list[TextBlock], blocks_b: list[TextBlock]) -> list[d
 
 COMPARISON_SYSTEM_PROMPT = """Eres un comparador documental semántico.
 Debes ignorar formato, maquetación, encabezados/pies repetidos, numeraciones y ruido OCR.
+Considera equivalentes las listas con viñetas y el mismo contenido escrito como frase corrida.
 Solo clasifica hallazgos con: añadido, eliminado o modificado.
 No inventes cambios ni expliques libremente.
+Responde exclusivamente con un único objeto JSON válido, sin markdown ni texto adicional.
+En source_a y source_b devuelve solo el fragmento mínimo necesario, no repitas bloques completos.
 Devuelve JSON estricto con esta forma: {\"changes\":[{\"change_type\":\"añadido|eliminado|modificado\",\"source_a\":\"texto en A o vacío\",\"source_b\":\"texto en B o vacío\",\"summary\":\"resumen breve\",\"confidence\":\"baja|media|alta\",\"severity\":\"baja|media|alta|critica\",\"evidence\":\"frase corta\",\"anchor_a\":0,\"anchor_b\":0}]}
 Si no hay cambios, responde {\"changes\":[]}.
 No dupliques hallazgos. Sé prudente cuando la evidencia sea débil."""
@@ -283,6 +286,9 @@ def _heuristic_compare_pair(block_a: TextBlock | None, block_b: TextBlock | None
         )
     if normalize_text(text_a) == normalize_text(text_b):
         return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
+    similarity = _token_overlap_score(text_a, text_b)
+    if similarity >= 0.985 and _relative_length_score(text_a, text_b) >= 0.96:
+        return LLMComparisonResponse.model_validate({"changes": []}), "high_similarity_equal"
     return None
 
 
@@ -379,59 +385,57 @@ def _persist_runtime_snapshot(
 ) -> None:
     try:
         from app.services.queue import persist_job_result, update_job_state
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("No se pudo persistir snapshot intermedio %s: %s", sid, exc)
-        return
-
-    visible_rows = deduplicate_rows(rows)
-    percent = 20 if total_pairs <= 0 else min(99, 20 + int((compared_pairs / total_pairs) * 75))
-    payload = {
-        "sid": sid,
-        "status": status,
-        "ok": status != "error",
-        "error": None,
-        "rows": _rows_to_payload(visible_rows),
-        "progress": {
-            "percent": percent if status == "running" else 100,
-            "step": step,
-            "detail": detail,
-            "completed_pairs": compared_pairs,
-            "total_pairs": total_pairs,
-            "failed_blocks": failed_blocks,
-            "fallback_blocks": fallback_blocks,
-        },
-        "meta": {
-            "partial_result": partial_result,
-            "pagination": {
-                "offset": 0,
-                "limit": None,
-                "returned": len(visible_rows),
-                "total": len(visible_rows),
-                "has_more": False,
-                "next_offset": None,
-                "truncated": False,
-            },
-            "cache": {
-                "policy": "incremental_result_file",
-                "resolved_from_cache": 0,
+        visible_rows = deduplicate_rows(rows)
+        percent = 20 if total_pairs <= 0 else min(99, 20 + int((compared_pairs / total_pairs) * 75))
+        payload = {
+            "sid": sid,
+            "status": status,
+            "ok": status != "error",
+            "error": None,
+            "rows": _rows_to_payload(visible_rows),
+            "progress": {
+                "percent": percent if status == "running" else 100,
+                "step": step,
+                "detail": detail,
+                "completed_pairs": compared_pairs,
+                "total_pairs": total_pairs,
                 "failed_blocks": failed_blocks,
                 "fallback_blocks": fallback_blocks,
             },
-        },
-    }
-    persist_job_result(sid, payload)
-    update_job_state(
-        sid,
-        status=status,
-        percent=payload["progress"]["percent"],
-        step=step,
-        detail=detail,
-        partial_result=partial_result,
-        failed_blocks=failed_blocks,
-        total_pairs=total_pairs,
-        completed_pairs=compared_pairs,
-        fallback_blocks=fallback_blocks,
-    )
+            "meta": {
+                "partial_result": partial_result,
+                "pagination": {
+                    "offset": 0,
+                    "limit": None,
+                    "returned": len(visible_rows),
+                    "total": len(visible_rows),
+                    "has_more": False,
+                    "next_offset": None,
+                    "truncated": False,
+                },
+                "cache": {
+                    "policy": "incremental_result_file",
+                    "resolved_from_cache": 0,
+                    "failed_blocks": failed_blocks,
+                    "fallback_blocks": fallback_blocks,
+                },
+            },
+        }
+        persist_job_result(sid, payload)
+        update_job_state(
+            sid,
+            status=status,
+            percent=payload["progress"]["percent"],
+            step=step,
+            detail=detail,
+            partial_result=partial_result,
+            failed_blocks=failed_blocks,
+            total_pairs=total_pairs,
+            completed_pairs=compared_pairs,
+            fallback_blocks=fallback_blocks,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudo persistir snapshot intermedio %s: %s", sid, exc)
 
 
 def compare_documents(

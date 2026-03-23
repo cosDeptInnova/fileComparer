@@ -111,3 +111,19 @@ def test_llm_client_compare_retries_without_response_format_when_content_is_empt
     assert len(fake_http_client.calls) == 2
     assert fake_http_client.calls[0][1]["response_format"] == {"type": "json_object"}
     assert "response_format" not in fake_http_client.calls[1][1]
+
+
+def test_extract_json_message_accepts_escaped_json_string_payload():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": '"{\\"changes\\":[{\\"change_type\\":\\"modificado\\",\\"source_a\\":\\"A\\",\\"source_b\\":\\"B\\"}]}"'
+                }
+            }
+        ]
+    }
+
+    data = _extract_json_message(payload)
+
+    assert data["changes"][0]["change_type"] == "modificado"
