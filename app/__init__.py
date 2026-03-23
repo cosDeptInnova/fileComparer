@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - fallback when python-dotenv is not yet installed.
+    def load_dotenv(*args, **kwargs):
+        return False
 
 
 def load_project_env() -> None:
