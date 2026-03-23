@@ -1,23 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 import os
 import platform
 import socket
 import sys
 from importlib import metadata
-from typing import Sequence
-
-from rq import Queue, SimpleWorker, Worker
+from typing import Any, Sequence
 
 from app.settings import settings
 from app.services.queue import redis_connection
-
-try:
-    from rq.worker import SpawnWorker
-except ImportError:  # pragma: no cover - exercised via tests with monkeypatched rq modules
-    SpawnWorker = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +26,7 @@ WORKER_CLASS_ALIASES = {
     "default": "worker",
     "classic": "worker",
 }
+_RQ_RUNTIME_CACHE: dict[str, Any] | None = None
 
 
 def _clean_name_part(value: str) -> str:
@@ -87,16 +82,22 @@ def is_windows() -> bool:
     return platform.system().lower() == "windows"
 
 
-def _spawn_worker_class() -> type[Worker] | None:
-    return SpawnWorker
-
-
 def _legacy_worker_error() -> RuntimeError:
     return RuntimeError(
         "El worker por defecto de RQ (`Worker` / `rq worker`) no es válido en Windows para este proyecto "
         "porque depende de fork() y acaba rompiendo con `AttributeError: module 'os' has no attribute 'fork'`. "
         "Usa `python -m app.worker`, que selecciona `SpawnWorker` automáticamente cuando RQ >= 2.2 está disponible. "
         "No vuelvas a arrancar `rq worker` a mano en Windows."
+    )
+
+
+def _windows_rq_import_error(exc: BaseException) -> RuntimeError:
+    return RuntimeError(
+        "No se pudo cargar RQ de forma segura en Windows. "
+        "Este proyecto debe arrancarse con `python -m app.worker` para resolver la clase adecuada y evitar el crash de `fork()`. "
+        "Si tu versión de RQ no soporta `SpawnWorker`, actualiza a RQ >= 2.2 o usa "
+        "`COMPARE_WINDOWS_WORKER_MODE=development` solo como escape temporal de desarrollo. "
+        f"Error original: {exc.__class__.__name__}: {exc}"
     )
 
 
@@ -111,7 +112,49 @@ def _missing_spawn_worker_error() -> RuntimeError:
     )
 
 
-def select_worker_class() -> type[Worker]:
+def _load_rq_runtime() -> dict[str, Any]:
+    global _RQ_RUNTIME_CACHE
+    if _RQ_RUNTIME_CACHE is not None:
+        return _RQ_RUNTIME_CACHE
+
+    try:
+        rq_module = importlib.import_module("rq")
+        rq_worker_module = importlib.import_module("rq.worker")
+    except ImportError as exc:
+        if is_windows():
+            raise _windows_rq_import_error(exc) from exc
+        raise
+    except AttributeError as exc:
+        if is_windows() and "fork" in str(exc).lower():
+            raise _windows_rq_import_error(exc) from exc
+        raise
+
+    _RQ_RUNTIME_CACHE = {
+        "Queue": rq_module.Queue,
+        "SimpleWorker": rq_module.SimpleWorker,
+        "Worker": rq_module.Worker,
+        "SpawnWorker": getattr(rq_worker_module, "SpawnWorker", None),
+    }
+    return _RQ_RUNTIME_CACHE
+
+
+def _queue_class() -> type[Any]:
+    return _load_rq_runtime()["Queue"]
+
+
+def _simple_worker_class() -> type[Any]:
+    return _load_rq_runtime()["SimpleWorker"]
+
+
+def _default_worker_class() -> type[Any]:
+    return _load_rq_runtime()["Worker"]
+
+
+def _spawn_worker_class() -> type[Any] | None:
+    return _load_rq_runtime()["SpawnWorker"]
+
+
+def select_worker_class() -> type[Any]:
     requested = requested_worker_class()
     on_windows = is_windows()
 
@@ -131,7 +174,7 @@ def select_worker_class() -> type[Worker]:
                 "Configura `COMPARE_WINDOWS_WORKER_MODE=development` si de verdad necesitas ese modo temporal. "
                 "No es una configuración de producción."
             )
-        return SimpleWorker
+        return _simple_worker_class()
 
     if on_windows:
         spawn_worker = _spawn_worker_class()
@@ -142,10 +185,10 @@ def select_worker_class() -> type[Worker]:
                 "SpawnWorker no está disponible en RQ %s; usando SimpleWorker solo como fallback de desarrollo en Windows.",
                 rq_version(),
             )
-            return SimpleWorker
+            return _simple_worker_class()
         raise _missing_spawn_worker_error()
 
-    return Worker
+    return _default_worker_class()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -179,11 +222,12 @@ def create_worker(
     *,
     worker_name: str | None = None,
     connection=None,
-) -> Worker:
+):
     worker_cls = select_worker_class()
+    queue_cls = _queue_class()
     resolved_name = worker_name or build_worker_name()
     conn = connection or redis_connection()
-    queues = [Queue(name, connection=conn) for name in queue_names]
+    queues = [queue_cls(name, connection=conn) for name in queue_names]
     logger.info(
         "Inicializando worker RQ: platform=%s rq_version=%s worker_class=%s queues=%s worker_name=%s windows_mode=%s",
         platform.system(),

@@ -64,3 +64,29 @@ def test_read_job_state_decodes_bytes(monkeypatch):
     state = queue_module.read_job_state("abc")
 
     assert state == {"status": "done", "percent": 100, "progress": {"detail": "ok"}}
+
+
+class DummyQueue:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+def test_compare_queue_imports_rq_lazily(monkeypatch):
+    import types
+    import sys
+
+    rq_mod = types.ModuleType("rq")
+    rq_mod.Queue = DummyQueue
+    monkeypatch.setitem(sys.modules, "rq", rq_mod)
+    fake_connection = object()
+    monkeypatch.setattr(queue_module, "redis_connection", lambda: fake_connection)
+
+    queue = queue_module.compare_queue()
+
+    assert isinstance(queue, DummyQueue)
+    assert queue.args == (queue_module.settings.rq_queue_name,)
+    assert queue.kwargs == {
+        "connection": fake_connection,
+        "default_timeout": int(queue_module.settings.llm_timeout_seconds * 4),
+    }

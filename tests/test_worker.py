@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -41,7 +43,12 @@ class DummySpawnWorker(DummyWorker):
     pass
 
 
-def _load_worker_module(monkeypatch, *, include_spawn=True):
+def _clear_app_modules():
+    sys.modules.pop("app.services.queue", None)
+    sys.modules.pop("app.worker", None)
+
+
+def _install_runtime_modules(monkeypatch, *, include_spawn=True):
     redis_mod = types.ModuleType("redis")
     rq_mod = types.ModuleType("rq")
     rq_worker_mod = types.ModuleType("rq.worker")
@@ -57,9 +64,25 @@ def _load_worker_module(monkeypatch, *, include_spawn=True):
     monkeypatch.setitem(sys.modules, "redis", redis_mod)
     monkeypatch.setitem(sys.modules, "rq", rq_mod)
     monkeypatch.setitem(sys.modules, "rq.worker", rq_worker_mod)
-    sys.modules.pop("app.services.queue", None)
-    sys.modules.pop("app.worker", None)
+
+
+def _load_worker_module(monkeypatch, *, include_spawn=True):
+    _install_runtime_modules(monkeypatch, include_spawn=include_spawn)
+    _clear_app_modules()
     return importlib.import_module("app.worker")
+
+
+def test_importing_worker_module_does_not_require_rq(monkeypatch):
+    redis_mod = types.ModuleType("redis")
+    redis_mod.Redis = DummyRedis
+    monkeypatch.setitem(sys.modules, "redis", redis_mod)
+    monkeypatch.delitem(sys.modules, "rq", raising=False)
+    monkeypatch.delitem(sys.modules, "rq.worker", raising=False)
+    _clear_app_modules()
+
+    worker_module = importlib.import_module("app.worker")
+
+    assert worker_module.requested_worker_class() == "auto"
 
 
 def test_build_worker_name_includes_instance_host_and_pid(monkeypatch):
@@ -104,13 +127,30 @@ def test_windows_forced_default_worker_aborts_with_explicit_error(monkeypatch):
     worker_module = _load_worker_module(monkeypatch, include_spawn=True)
     monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
 
-    try:
+    with pytest.raises(RuntimeError, match="rq worker"):
         worker_module.select_worker_class()
-    except RuntimeError as exc:
-        assert "rq worker" in str(exc)
-        assert "Windows" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected RuntimeError")
+
+
+def test_windows_import_failure_returns_controlled_runtime_error(monkeypatch):
+    worker_module = _load_worker_module(monkeypatch, include_spawn=True)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    worker_module._RQ_RUNTIME_CACHE = None
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name, package=None):
+        if name == "rq":
+            raise AttributeError("module 'os' has no attribute 'fork'")
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(worker_module.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        worker_module.select_worker_class()
+
+    assert "No se pudo cargar RQ de forma segura en Windows" in str(excinfo.value)
+    assert "fork()" in str(excinfo.value)
 
 
 def test_windows_without_spawn_requires_rq_22_or_development_fallback(monkeypatch):
@@ -120,13 +160,8 @@ def test_windows_without_spawn_requires_rq_22_or_development_fallback(monkeypatc
     monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
     monkeypatch.setattr(worker_module, "rq_version", lambda: "1.16.2")
 
-    try:
+    with pytest.raises(RuntimeError, match="RQ >= 2.2"):
         worker_module.select_worker_class()
-    except RuntimeError as exc:
-        assert "RQ >= 2.2" in str(exc)
-        assert "1.16.2" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected RuntimeError")
 
 
 def test_windows_development_fallback_uses_simple_worker_only_when_spawn_missing(monkeypatch):
