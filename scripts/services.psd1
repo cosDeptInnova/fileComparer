@@ -30,6 +30,7 @@
       Env=@{
         COMPARE_REQUIRE_ACTIVE_WORKERS="true"
       };
+      CompanionFailureIsFatal=$true;
       EnvFile="config\comp_docs.env";
       Port=8007
     },
@@ -46,6 +47,11 @@
         MAX_CONCURRENT_JOBS="4"
         COMPARE_WINDOWS_WORKER_MODE="production"
       };
+      StartupFailureIsFatal=$true;
+      RequireAllInstancesRunning=$true;
+      StartupProbeDelayMs=1500;
+      ReadyTimeoutSec=45;
+      ReadyLogPattern="Inicializando worker RQ:";
       EnvFile="config\comp_docs.env";
       Port=0
     },

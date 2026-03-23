@@ -80,7 +80,12 @@ Al arrancar `comp_docs` con `start-service.ps1`, el script también levanta auto
 su servicio compañero `comp_docs_worker`. El arranque es idempotente: si el worker ya
 está en ejecución, no se duplica el proceso. Además, el companion del comparador se
 levanta antes que la API web para evitar falsos diagnósticos de "sin workers activos"
-durante el startup de FastAPI.
+durante el startup de FastAPI. Si el worker RQ no llega a arrancar bien (por ejemplo, cae
+antes de registrar el log `Inicializando worker RQ:`), el arranque de `comp_docs` falla y
+la API no se deja levantada en falso.
+
+IMPORTANTE: en Windows NO usar `rq worker` manualmente. Usa `python -m app.worker`, `scripts\start_worker.ps1` o `start-service.ps1 -Name comp_docs_worker`, que fuerzan la selección segura de worker.
+Al detener `comp_docs` con `stop-service.ps1 -Name comp_docs`, el script baja también `comp_docs_worker`; si detienes solo `comp_docs_worker`, se bajan únicamente las colas/workers del comparador.
 
 IMPORTANTE: en Windows NO usar `rq worker` manualmente. Usa `python -m app.worker`, `scripts\start_worker.ps1` o `start-service.ps1 -Name comp_docs_worker`, que fuerzan la selección segura de worker.
 
@@ -107,7 +112,7 @@ como configuración efectiva del comparador. Las variables operativas relevantes
 - `COMPARE_OCR_TIMEOUT_SECONDS`
 - `COMPARE_LLM_TIMEOUT_SECONDS`
 
-`comp_docs_worker` arranca con múltiples procesos RQ (`ProcessCount` en `scripts\services.psd1`). En Windows, cada proceso usa `python -m app.worker` y la fábrica centralizada selecciona `SpawnWorker` (RQ >= 2.2) en lugar del worker clásico de RQ. Si faltase `SpawnWorker`, el modo `production` aborta con error explícito; el modo `development` solo permite un fallback controlado con `SimpleWorker`, no válido como solución de producción. Como RQ procesa un job por proceso, el control real es el número de workers: puedes cambiarlo en `scripts\services.psd1`, con `-CompDocsWorkerCount`, o reutilizar `-CompDocsWorkerConcurrency` como alias operativo cuando quieras levantar N workers desde los scripts.
+`comp_docs_worker` arranca con múltiples procesos RQ (`ProcessCount` en `scripts\services.psd1`). En Windows, cada proceso usa `python -m app.worker` y la fábrica centralizada selecciona `SpawnWorker` (RQ >= 2.2) en lugar del worker clásico de RQ. Si faltase `SpawnWorker`, el modo `production` aborta con error explícito; el modo `development` solo permite un fallback controlado con `SimpleWorker`, no válido como solución de producción. Además, `start-service.ps1` y `start-all.ps1` ahora validan que todos los procesos del worker sigan vivos y que aparezca el log `Inicializando worker RQ:` antes de considerar el stack del comparador como arrancado. Como RQ procesa un job por proceso, el control real es el número de workers: puedes cambiarlo en `scripts\services.psd1`, con `-CompDocsWorkerCount`, o reutilizar `-CompDocsWorkerConcurrency` como alias operativo cuando quieras levantar N workers desde los scripts.
 
 
 6. Gestión robusta de puertos
