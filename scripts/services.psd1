@@ -36,14 +36,14 @@
     @{
       Name="comp_docs_worker"; Path="comp_docs";
       LaunchMode="python";
-      Args=@("-m","app.compare_worker");
+      Args=@("-m","app.worker");
       ProcessCount=4;
       Env=@{
         COMPARE_PROCESS_ROLE="worker";
-        COMPARE_WORKER_CONCURRENCY="2";
-        COMPARE_MAX_INFERENCE_CONCURRENCY="1";
-        COMPARE_QUEUE_PREFETCH="1";
-        MAX_CONCURRENT_JOBS="2"
+        COMPARE_WORKER_IMPLEMENTATION="rq";
+        COMPARE_WORKER_CONCURRENCY="1";
+        COMPARE_QUEUE_NAME="compare";
+        MAX_CONCURRENT_JOBS="4"
       };
       EnvFile="config\comp_docs.env";
       Port=0

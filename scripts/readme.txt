@@ -74,7 +74,7 @@ Servicio `comp_docs` y worker dedicado
 --------------------------------------
 Para `comp_docs` ahora existen dos entradas gestionadas por scripts y apuntan al worker real:
 - `comp_docs` -> proceso web FastAPI en el puerto 8007
-- `comp_docs_worker` -> worker dedicado del comparador (`python -m app.compare_worker`)
+- `comp_docs_worker` -> worker dedicado del comparador (`python -m app.worker`)
 
 Al arrancar `comp_docs` con `start-service.ps1`, el script también levanta automáticamente
 su servicio compañero `comp_docs_worker`. El arranque es idempotente: si el worker ya
@@ -105,7 +105,7 @@ como configuración efectiva del comparador. Las variables operativas relevantes
 - `COMPARE_OCR_TIMEOUT_SECONDS`
 - `COMPARE_LLM_TIMEOUT_SECONDS`
 
-`comp_docs_worker` arranca con `ProcessCount=12`, `COMPARE_WORKER_CONCURRENCY=16` y `MAX_CONCURRENT_JOBS=16` por defecto. Puedes cambiar el número de procesos en `scripts\services.psd1` o en tiempo de arranque con `-CompDocsWorkerCount`, y ajustar la concurrencia interna con `-CompDocsWorkerConcurrency`.
+`comp_docs_worker` arranca con múltiples procesos RQ (`ProcessCount` en `scripts\services.psd1`). Como RQ procesa un job por proceso, el control real es el número de workers: puedes cambiarlo en `scripts\services.psd1`, con `-CompDocsWorkerCount`, o reutilizar `-CompDocsWorkerConcurrency` como alias operativo cuando quieras levantar N workers desde los scripts.
 
 
 6. Gestión robusta de puertos
@@ -149,3 +149,27 @@ Por tanto, se debe ejecutar en la misma consola donde se exportaron esas variabl
 - "Cannot find 'conda'": ejecutar 'conda init powershell' y reiniciar la consola, o asegurar conda en PATH.
 - "port XXXX still busy": ejecutar PowerShell como administrador y relanzar stop-all / start-all.
 - "timeout port did not open": revisar logs/<svc>.err.log y comprobar args/paths/env.
+
+
+10. Cómo levantar la plataforma completa y probar el comparador
+------------------------------------------------------------
+Desde la carpeta /scripts de la plataforma completa:
+
+1) Arranca toda la plataforma con el comparador y sus workers:
+  .\start-all.ps1 -CompDocsWorkerCount 4
+
+2) Si necesitas reiniciar solo el comparador y sus workers:
+  .\stop-service.ps1 -Name comp_docs -ShowStatus
+  .\start-service.ps1 -Name comp_docs -CompDocsWorkerCount 4 -ShowStatus
+
+3) Si quieres tocar solo los workers del comparador:
+  .\stop-service.ps1 -Name comp_docs_worker -ShowStatus
+  .\start-service.ps1 -Name comp_docs_worker -CompDocsWorkerCount 4 -ShowStatus
+
+4) Verifica estado general:
+  .\status.ps1
+
+5) Para probar desde la plataforma completa, abre la SPA y entra en la vista de comparación de archivos.
+   El backend del comparador quedará expuesto en el puerto 8007 y el front seguirá usando
+   `/api/comparador/comparar`, `/api/comparador/progress/{sid}` y `/api/comparador/resultado/{sid}/json`
+   a través del proxy/plataforma existente.
