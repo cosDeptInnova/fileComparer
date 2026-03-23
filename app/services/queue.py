@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 from redis import Redis
-from rq import Queue
 
 from app.settings import settings
 
@@ -23,8 +23,9 @@ def redis_connection() -> Redis:
     return Redis.from_url(settings.redis_url, decode_responses=False)
 
 
-def compare_queue() -> Queue:
-    return Queue(
+def compare_queue():
+    queue_class = import_module("rq").Queue
+    return queue_class(
         settings.rq_queue_name,
         connection=redis_connection(),
         default_timeout=int(settings.llm_timeout_seconds * 4),
