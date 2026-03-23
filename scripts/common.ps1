@@ -122,6 +122,106 @@ function Get-ServiceInstanceCount {
   return $count
 }
 
+function Test-FileContainsText {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$Pattern
+  )
+
+  if (-not $Pattern) { return $true }
+  if (-not (Test-Path $Path)) { return $false }
+
+  try {
+    return [bool](Select-String -Path $Path -Pattern $Pattern -SimpleMatch -Quiet -ErrorAction SilentlyContinue)
+  } catch {
+    return $false
+  }
+}
+
+function Get-LogTailText {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [int]$Lines = 40
+  )
+
+  if (-not (Test-Path $Path)) { return "" }
+
+  try {
+    return ((Get-Content $Path -Tail $Lines -ErrorAction SilentlyContinue) -join [Environment]::NewLine)
+  } catch {
+    return ""
+  }
+}
+
+function Wait-NonPortServiceReady {
+  param(
+    [Parameter(Mandatory=$true)][string]$Root,
+    [Parameter(Mandatory=$true)]$Svc
+  )
+
+  $name = Try-GetProp -Obj $Svc -Name "Name" -Default ""
+  if (-not $name) { return }
+
+  $instanceCount = Get-ServiceInstanceCount -Svc $Svc
+  $requireAllInstances = Try-GetBool -Obj $Svc -Name "RequireAllInstancesRunning" -Default $false
+  $readyLogPattern = (Try-GetProp -Obj $Svc -Name "ReadyLogPattern" -Default "")
+  $probeDelayMs = Try-GetInt -Obj $Svc -Name "StartupProbeDelayMs" -Default 200
+  $readyTimeoutSec = Try-GetInt -Obj $Svc -Name "ReadyTimeoutSec" -Default (Try-GetInt -Obj $Svc -Name "StartupTimeoutSec" -Default 180)
+
+  if (-not $requireAllInstances -and (-not $readyLogPattern)) {
+    if ($probeDelayMs -gt 0) { Start-Sleep -Milliseconds $probeDelayMs }
+    return
+  }
+
+  if ($probeDelayMs -gt 0) { Start-Sleep -Milliseconds $probeDelayMs }
+
+  $targetInstances = if ($instanceCount -gt 1) { 1..$instanceCount } else { @(0) }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+
+  while ($sw.Elapsed.TotalSeconds -lt $readyTimeoutSec) {
+    $allRunning = $true
+    $allReady = $true
+
+    foreach ($instanceNumber in $targetInstances) {
+      $pidFile = Get-PidFile -Root $Root -ServiceName $name -InstanceNumber $instanceNumber
+      if (-not (Is-Running -PidFile $pidFile)) {
+        $allRunning = $false
+        $allReady = $false
+        continue
+      }
+
+      if ($readyLogPattern) {
+        $logs = Get-LogFiles -Root $Root -ServiceName $name -InstanceNumber $instanceNumber
+        if (-not (Test-FileContainsText -Path $logs.Out -Pattern $readyLogPattern)) {
+          $allReady = $false
+        }
+      }
+    }
+
+    $runningOk = ((-not $requireAllInstances) -or $allRunning)
+    $readyOk = ((-not $readyLogPattern) -or $allReady)
+    if ($runningOk -and $readyOk) { return }
+
+    Start-Sleep -Milliseconds 400
+  }
+
+  $details = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($instanceNumber in $targetInstances) {
+    $instanceLabel = if ($instanceNumber -gt 0) { "$name#$instanceNumber" } else { $name }
+    $pidFile = Get-PidFile -Root $Root -ServiceName $name -InstanceNumber $instanceNumber
+    $logs = Get-LogFiles -Root $Root -ServiceName $name -InstanceNumber $instanceNumber
+    $pid = Read-PidFileSafe -PidFile $pidFile
+    $alive = if ($pid) { Test-ProcessAlive -ProcessId $pid } else { $false }
+    $patternSeen = if ($readyLogPattern) { Test-FileContainsText -Path $logs.Out -Pattern $readyLogPattern } else { $true }
+    $tail = Get-LogTailText -Path $logs.Err -Lines 20
+    if (-not $tail) { $tail = Get-LogTailText -Path $logs.Out -Lines 20 }
+
+    $details.Add(("{0}: wrapper_pid={1}; alive={2}; ready_log={3}; err_tail={4}" -f $instanceLabel, $pid, $alive, $patternSeen, $tail))
+  }
+
+  throw "[$name] readiness check failed after ${readyTimeoutSec}s. Details: $($details -join ' || ')"
+}
+
 function Set-CompDocsWorkerScaling {
   param(
     [Parameter(Mandatory=$true)][hashtable]$Config,
@@ -820,6 +920,8 @@ function Start-ServiceProcess {
 
   $timeout  = Try-GetInt  -Obj $Svc    -Name "StartupTimeoutSec" -Default 180
   $failFast = Try-GetBool -Obj $Config -Name "FailFast"          -Default $false
+  $strictStartup = Try-GetBool -Obj $Svc -Name "StartupFailureIsFatal" -Default $false
+  $companionFailureIsFatal = Try-GetBool -Obj $Svc -Name "CompanionFailureIsFatal" -Default $false
 
   $startCompanions = {
     param([string]$CurrentServiceName)
@@ -831,6 +933,9 @@ function Start-ServiceProcess {
         $companionSvc = Resolve-ServiceByName -Config $Config -Name $targetName
         Start-ServiceProcess -Config $Config -Svc $companionSvc -SkipCompanionStart
       } catch {
+        if ($companionFailureIsFatal) {
+          throw "[$CurrentServiceName] no se pudo arrancar companion service '$targetName': $($_.Exception.Message)"
+        }
         Write-Host "[$CurrentServiceName] WARNING: no se pudo arrancar companion service '$targetName': $($_.Exception.Message)"
       }
     }
@@ -889,7 +994,7 @@ function Start-ServiceProcess {
         Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
         $runningCount -= 1
 
-        if ($failFast) { throw "Service ${name} failed to start (port $port not listening)." }
+        if ($failFast -or $strictStartup) { throw "Service ${name} failed to start (port $port not listening)." }
         Write-Host "[$instanceLabel] Continuing (FailFast=false)."
         return
       }
@@ -901,7 +1006,7 @@ function Start-ServiceProcess {
         Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
         $runningCount -= 1
 
-        if ($failFast) { throw "Service ${name} instance ${instanceNumber} failed to stay alive." }
+        if ($failFast -or $strictStartup) { throw "Service ${name} instance ${instanceNumber} failed to stay alive." }
         Write-Host "[$instanceLabel] Continuing (FailFast=false)."
         continue
       }
@@ -912,6 +1017,17 @@ function Start-ServiceProcess {
 
   if ($instanceCount -gt 1) {
     Write-Host "[$name] Active instances: $runningCount/$instanceCount (started now: $startedCount)."
+  }
+
+  if ($port -le 0) {
+    try {
+      Wait-NonPortServiceReady -Root $root -Svc $Svc
+    } catch {
+      Write-Host "[$name] ERROR: $($_.Exception.Message)"
+      if ($strictStartup -or $failFast) { throw }
+      Write-Host "[$name] Continuing (FailFast=false and StartupFailureIsFatal=false)."
+      return
+    }
   }
 
   if ((-not $SkipCompanionStart) -and $companionStartOrder -ne "before") {
@@ -948,6 +1064,17 @@ function Stop-ServiceProcess {
           Write-Host "[$instanceLabel] STOP wrapper PID $wrapperProc"
           Stop-ProcessTreeRobust -ProcessId $wrapperProc
         } catch { }
+
+        $waitSw = [Diagnostics.Stopwatch]::StartNew()
+        while ($waitSw.Elapsed.TotalSeconds -lt 8) {
+          if (-not (Test-ProcessAlive -ProcessId $wrapperProc)) { break }
+          Start-Sleep -Milliseconds 250
+        }
+
+        if (Test-ProcessAlive -ProcessId $wrapperProc) {
+          Write-Host "[$instanceLabel] WARNING: wrapper PID $wrapperProc sigue vivo tras el stop; reintentando hard-kill."
+          try { Stop-ProcessWithAncestorsRobust -ProcessId $wrapperProc } catch { }
+        }
       } else {
         Write-Host "[$instanceLabel] wrapper PID $wrapperProc ya no existe."
       }
