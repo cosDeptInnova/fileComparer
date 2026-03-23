@@ -55,10 +55,12 @@ class LLMClient:
 
     def startup(self) -> None:
         if self._client is None:
+            LOGGER.info("Inicializando LLMClient con base_url=%s model=%s", self.base_url, self.model_name)
             self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
 
     def shutdown(self) -> None:
         if self._client is not None:
+            LOGGER.info("Cerrando LLMClient")
             self._client.close()
             self._client = None
 
@@ -69,10 +71,18 @@ class LLMClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.shutdown()
 
-    def _headers(self) -> dict[str, str] | None:
+    def _build_headers(self) -> dict[str, str] | None:
         if not self.api_key:
             return None
-        return {"Authorization": f"Bearer {self.api_key}"}
+        auth_value = f"Bearer {self.api_key}"
+        try:
+            auth_value.encode("ascii")
+        except UnicodeEncodeError:
+            LOGGER.error(
+                "LLAMA_SERVER_API_KEY contiene caracteres no ASCII; se omite Authorization para evitar errores de codificación."
+            )
+            return None
+        return {"Authorization": auth_value}
 
     def _raise_if_aborted(self, *, stage: str) -> None:
         if callable(self.should_abort) and self.should_abort():
@@ -130,7 +140,7 @@ class LLMClient:
         try:
             self._raise_if_aborted(stage="before_http_post")
             observe_inference_concurrency(self.inference_semaphore.active_count())
-            response = self._client.post("/chat/completions", json=payload, headers=self._headers())
+            response = self._client.post("chat/completions", json=payload, headers=self._build_headers())
             LOGGER.info(
                 "LLM compare request %s finished in %.3fs status=%s active_inference=%s lease=%s",
                 request_id,
@@ -189,6 +199,17 @@ class LLMClient:
         finally:
             observe_llm_duration(time.perf_counter() - started, outcome=outcome)
             observe_inference_concurrency(self.inference_semaphore.active_count())
+
+    def health_check(self) -> bool:
+        if self._client is None:
+            self.startup()
+        try:
+            response = self._client.get("health")
+            response.raise_for_status()
+            return True
+        except Exception as exc:
+            LOGGER.warning("Health check a llama.cpp falló: %s", exc)
+            return False
 
 
 def _with_json_retry_reminder(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
