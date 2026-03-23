@@ -88,10 +88,11 @@ Ejemplos:
   .\start-service.ps1 -Name comp_docs_worker -CompDocsWorkerCount 12 -CompDocsWorkerConcurrency 24
   .\start-all.ps1 -CompDocsWorkerCount 12
   .\start-all.ps1 -CompDocsWorkerConcurrency 24
-  .\stop-service.ps1 -Name comp_docs_worker
+  .\stop-service.ps1 -Name comp_docs_worker   (también baja `comp_docs` antes del worker para evitar dejar la API sin consumidores)
 
-`comp_docs` y `comp_docs_worker` cargan `config\ALL_EXPORT.env` como base global y `config\comp_docs.env`
-como configuración efectiva del comparador. Las variables operativas relevantes son, entre otras:
+`comp_docs` y `comp_docs_worker` cargan `config\ALL_EXPORT.env` como base global y `comp_docs.env`
+como configuración efectiva del comparador. Si además existe `config\comp_docs.env`, también se respeta.
+Las variables operativas relevantes son, entre otras:
 - `TEXT_COMPARE_MAX_FILE_MB`
 - `COMPARE_REQUIRE_ACTIVE_WORKERS`
 - `COMPARE_PROGRESS_TTL_SECONDS`
@@ -103,7 +104,7 @@ como configuración efectiva del comparador. Las variables operativas relevantes
 - `COMPARE_OCR_TIMEOUT_SECONDS`
 - `COMPARE_LLM_TIMEOUT_SECONDS`
 
-`comp_docs_worker` arranca con `ProcessCount=12`, `COMPARE_WORKER_CONCURRENCY=16` y `MAX_CONCURRENT_JOBS=16` por defecto. Puedes cambiar el número de procesos en `scripts\services.psd1` o en tiempo de arranque con `-CompDocsWorkerCount`, y ajustar la concurrencia interna con `-CompDocsWorkerConcurrency`.
+`comp_docs_worker` arranca con `ProcessCount=4`, `COMPARE_WORKER_CONCURRENCY=1` y `MAX_CONCURRENT_JOBS=4` por defecto. Puedes cambiar el número de procesos en `scripts\services.psd1` o en tiempo de arranque con `-CompDocsWorkerCount`; para RQ en Windows, `-CompDocsWorkerConcurrency` se traduce en número de procesos porque cada worker atiende 1 job a la vez.
 
 
 6. Gestión robusta de puertos
