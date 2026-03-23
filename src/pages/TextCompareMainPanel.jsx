@@ -596,9 +596,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
   const [fileB, setFileB] = useState(null);
   const [warn, setWarn] = useState(null);
   const [error, setError] = useState(null);
-  const euroMode = "strict";
-  const minEuro = "";
-  const engine = "auto";
+  const engine = capabilities.engines?.default || "auto";
   const [sid, setSid] = useState(null);
   const [progress, setProgress] = useState({
     percent: 0,
@@ -818,8 +816,6 @@ export default function TextCompareMainPanel({ isDarkMode }) {
       await fetchComparerCsrfToken();
 
       const options = {
-        euro_mode: euroMode,
-        min_euro: minEuro !== "" ? Number(minEuro) : null,
         engine,
       };
 
