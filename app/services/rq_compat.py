@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import logging
 import multiprocessing
+import os
 import platform
 import re
 from importlib import metadata
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _RQ_RUNTIME_CACHE: dict[str, Any] | None = None
 _PATCHED_WINDOWS_MP = False
+_PATCHED_WINDOWS_SPAWN_WORKER = False
 
 
 def is_windows() -> bool:
@@ -58,6 +60,37 @@ def _patch_windows_multiprocessing() -> None:
     _PATCHED_WINDOWS_MP = True
 
 
+def _patch_windows_spawn_worker(spawn_worker_cls: type[Any] | None) -> type[Any] | None:
+    global _PATCHED_WINDOWS_SPAWN_WORKER
+    if (
+        _PATCHED_WINDOWS_SPAWN_WORKER
+        or not is_windows()
+        or spawn_worker_cls is None
+        or hasattr(os, "wait4")
+    ):
+        return spawn_worker_cls
+
+    if not hasattr(os, "waitpid"):
+        logger.warning(
+            "Windows no expone os.wait4 ni os.waitpid; se mantiene SpawnWorker sin parche y podría fallar."
+        )
+        return spawn_worker_cls
+
+    original_wait_for_horse = getattr(spawn_worker_cls, "wait_for_horse", None)
+    if original_wait_for_horse is None:
+        return spawn_worker_cls
+
+    def _wait_for_horse(self):
+        pid, status = os.waitpid(self.horse_pid, 0)
+        return pid, status, None
+
+    setattr(spawn_worker_cls, "wait_for_horse", _wait_for_horse)
+    _PATCHED_WINDOWS_SPAWN_WORKER = True
+    logger.warning(
+        "RQ SpawnWorker usa os.wait4, que no existe en Windows; se redirige a os.waitpid para compatibilidad."
+    )
+    return spawn_worker_cls
+
 
 def _missing_rq_error(exc: BaseException) -> RuntimeError:
     return RuntimeError(
@@ -86,7 +119,7 @@ def load_rq_runtime() -> dict[str, Any]:
         "Queue": rq_module.Queue,
         "SimpleWorker": getattr(rq_module, "SimpleWorker", None),
         "Worker": getattr(rq_module, "Worker", None),
-        "SpawnWorker": getattr(worker_module, "SpawnWorker", None),
+        "SpawnWorker": _patch_windows_spawn_worker(getattr(worker_module, "SpawnWorker", None)),
     }
 
     if runtime["Queue"] is None or runtime["Worker"] is None:
