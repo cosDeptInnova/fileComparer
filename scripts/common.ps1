@@ -790,6 +790,9 @@ function Start-ServiceProcess {
   $pathRel = Try-GetProp -Obj $Svc -Name "Path" -Default ""
   $port    = Try-GetInt  -Obj $Svc -Name "Port" -Default 0
   $instanceCount = Get-ServiceInstanceCount -Svc $Svc
+  $companionStartOrder = (Try-GetProp -Obj $Svc -Name "CompanionStartOrder" -Default "after")
+  if (-not $companionStartOrder) { $companionStartOrder = "after" }
+  $companionStartOrder = $companionStartOrder.ToString().Trim().ToLowerInvariant()
 
   if (-not $name)    { throw "Service missing Name" }
   if (-not $pathRel) { throw "Service '$name' missing Path" }
@@ -808,6 +811,25 @@ function Start-ServiceProcess {
 
   $timeout  = Try-GetInt  -Obj $Svc    -Name "StartupTimeoutSec" -Default 180
   $failFast = Try-GetBool -Obj $Config -Name "FailFast"          -Default $false
+
+  $startCompanions = {
+    param([string]$CurrentServiceName)
+    $companions = @(As-Array (Try-GetProp -Obj $Svc -Name "CompanionServices" -Default $null))
+    foreach ($companionName in $companions) {
+      $targetName = "$companionName".Trim()
+      if (-not $targetName) { continue }
+      try {
+        $companionSvc = Resolve-ServiceByName -Config $Config -Name $targetName
+        Start-ServiceProcess -Config $Config -Svc $companionSvc -SkipCompanionStart
+      } catch {
+        Write-Host "[$CurrentServiceName] WARNING: no se pudo arrancar companion service '$targetName': $($_.Exception.Message)"
+      }
+    }
+  }
+
+  if ((-not $SkipCompanionStart) -and $companionStartOrder -eq "before") {
+    & $startCompanions $name
+  }
 
   $startedCount = 0
   $runningCount = 0
@@ -883,18 +905,8 @@ function Start-ServiceProcess {
     Write-Host "[$name] Active instances: $runningCount/$instanceCount (started now: $startedCount)."
   }
 
-  if (-not $SkipCompanionStart) {
-    $companions = @(As-Array (Try-GetProp -Obj $Svc -Name "CompanionServices" -Default $null))
-    foreach ($companionName in $companions) {
-      $targetName = "$companionName".Trim()
-      if (-not $targetName) { continue }
-      try {
-        $companionSvc = Resolve-ServiceByName -Config $Config -Name $targetName
-        Start-ServiceProcess -Config $Config -Svc $companionSvc -SkipCompanionStart
-      } catch {
-        Write-Host "[$name] WARNING: no se pudo arrancar companion service '$targetName': $($_.Exception.Message)"
-      }
-    }
+  if ((-not $SkipCompanionStart) -and $companionStartOrder -ne "before") {
+    & $startCompanions $name
   }
 }
 

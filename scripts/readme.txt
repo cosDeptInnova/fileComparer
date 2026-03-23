@@ -78,7 +78,9 @@ Para `comp_docs` ahora existen dos entradas gestionadas por scripts y apuntan al
 
 Al arrancar `comp_docs` con `start-service.ps1`, el script también levanta automáticamente
 su servicio compañero `comp_docs_worker`. El arranque es idempotente: si el worker ya
-está en ejecución, no se duplica el proceso.
+está en ejecución, no se duplica el proceso. Además, el companion del comparador se
+levanta antes que la API web para evitar falsos diagnósticos de "sin workers activos"
+durante el startup de FastAPI.
 
 Ejemplos:
   .\start-service.ps1 -Name comp_docs
