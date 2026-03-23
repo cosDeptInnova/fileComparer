@@ -87,6 +87,8 @@ la API no se deja levantada en falso.
 IMPORTANTE: en Windows NO usar `rq worker` manualmente. Usa `python -m app.worker`, `scripts\start_worker.ps1` o `start-service.ps1 -Name comp_docs_worker`, que fuerzan la selección segura de worker.
 Al detener `comp_docs` con `stop-service.ps1 -Name comp_docs`, el script baja también `comp_docs_worker`; si detienes solo `comp_docs_worker`, se bajan únicamente las colas/workers del comparador.
 
+IMPORTANTE: en Windows NO usar `rq worker` manualmente. Usa `python -m app.worker`, `scripts\start_worker.ps1` o `start-service.ps1 -Name comp_docs_worker`, que fuerzan la selección segura de worker.
+
 Ejemplos:
   .\start-service.ps1 -Name comp_docs
   .\start-service.ps1 -Name comp_docs_worker
