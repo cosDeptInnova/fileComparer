@@ -23,7 +23,7 @@ export function filterTextCompareRows(
 
   return rows.filter((row) => {
     const rowSeverity = normalizeFilterValue(row?.severity);
-    const rowChangeType = normalizeFilterValue(row?.change_type);
+    const rowChangeType = normalizeFilterValue(row?.change_type === "insertado" ? "añadido" : row?.change_type);
     if (
       normalizedSeverity !== TEXT_COMPARE_FILTER_ALL &&
       rowSeverity !== normalizedSeverity

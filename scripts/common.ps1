@@ -139,20 +139,27 @@ function Set-CompDocsWorkerScaling {
 
   if ($null -eq $workerSvc) { return }
 
-  $effectiveConcurrency = if ($WorkerConcurrency -gt 0) { $WorkerConcurrency } else { 0 }
-  if ($effectiveConcurrency -le 0) {
-    $effectiveConcurrency = Try-GetInt -Obj (Try-GetProp -Obj $workerSvc -Name "Env" -Default @{}) -Name "COMPARE_WORKER_CONCURRENCY" -Default 1
-  }
-
-  $effectiveWorkerCount = if ($WorkerCount -gt 0) { $WorkerCount } else { Get-ServiceInstanceCount -Svc $workerSvc }
-  if ($effectiveWorkerCount -le 0) { $effectiveWorkerCount = 1 }
-
-  $totalInflight = [Math]::Max(1, ($effectiveConcurrency * $effectiveWorkerCount))
-
   if (-not (Try-GetProp -Obj $workerSvc -Name "Env" -Default $null)) {
     $workerSvc.Env = @{}
   }
+
+  # Con RQ, cada proceso worker atiende 1 job cada vez.
+  # Para mantener el control desde los scripts existentes:
+  # - WorkerCount controla el número real de procesos worker.
+  # - WorkerConcurrency, si se informa sin WorkerCount, se interpreta como número deseado de procesos.
+  $configuredWorkerCount = Get-ServiceInstanceCount -Svc $workerSvc
+  $effectiveWorkerCount = if ($WorkerCount -gt 0) { $WorkerCount } else { $configuredWorkerCount }
+  if ($effectiveWorkerCount -le 0) { $effectiveWorkerCount = 1 }
+  if ($WorkerCount -le 0 -and $WorkerConcurrency -gt 0) {
+    $effectiveWorkerCount = $WorkerConcurrency
+  }
+
+  $effectiveConcurrency = 1
+  $totalInflight = [Math]::Max(1, $effectiveWorkerCount)
+
+  $workerSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "rq"
   $workerSvc.Env.COMPARE_WORKER_CONCURRENCY = [string]$effectiveConcurrency
+  $workerSvc.Env.COMPARE_WORKER_COUNT = [string]$effectiveWorkerCount
   $workerSvc.Env.MAX_CONCURRENT_JOBS = [string]$totalInflight
   $workerSvc.Env.COMPARE_MAX_INFLIGHT_JOBS = [string]$totalInflight
   $workerSvc.ProcessCount = $effectiveWorkerCount
@@ -161,6 +168,8 @@ function Set-CompDocsWorkerScaling {
     if (-not (Try-GetProp -Obj $webSvc -Name "Env" -Default $null)) {
       $webSvc.Env = @{}
     }
+    $webSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "rq"
+    $webSvc.Env.COMPARE_WORKER_COUNT = [string]$effectiveWorkerCount
     $webSvc.Env.MAX_CONCURRENT_JOBS = [string]$totalInflight
     $webSvc.Env.COMPARE_MAX_INFLIGHT_JOBS = [string]$totalInflight
   }
