@@ -8,6 +8,10 @@ NUMBERING_ONLY_SEGMENT_RE = re.compile(
     r"(?i)^(?:[ivxlcdm]+[\)\.]|\(?\d+(?:\.\d+)*[\)\.]|[a-z]\))$"
 )
 SHORT_SEGMENT_JOIN_THRESHOLD = 10
+WORD_RE = re.compile(r"\S+")
+WORDS_PER_BLOCK_MIN = 250
+WORDS_PER_BLOCK_MAX = 300
+LONG_UNIT_WORD_LIMIT = 320
 
 
 @dataclass(slots=True)
@@ -22,14 +26,16 @@ def sentence_segments(text: str) -> list[str]:
     cleaned = (text or "").strip()
     if not cleaned:
         return []
-    paragraph_chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", cleaned) if chunk.strip()]
-    if len(paragraph_chunks) > 1:
-        return _merge_short_prefix_segments(paragraph_chunks)
 
-    pieces = [piece.strip() for piece in SENTENCE_RE.split(cleaned) if piece.strip()]
-    if len(pieces) == 1:
-        return _merge_short_prefix_segments([segment.strip() for segment in re.split(r"\n+", cleaned) if segment.strip()])
-    return _merge_short_prefix_segments(pieces)
+    paragraph_chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", cleaned) if chunk.strip()]
+    segments: list[str] = []
+    source_segments = paragraph_chunks if paragraph_chunks else [cleaned]
+    for source in source_segments:
+        pieces = [piece.strip() for piece in SENTENCE_RE.split(source) if piece.strip()]
+        if len(pieces) <= 1:
+            pieces = [segment.strip() for segment in re.split(r"\n+", source) if segment.strip()]
+        segments.extend(_merge_short_prefix_segments(pieces))
+    return segments
 
 
 def _merge_short_prefix_segments(segments: list[str]) -> list[str]:
@@ -57,63 +63,69 @@ def _merge_short_prefix_segments(segments: list[str]) -> list[str]:
     return merged
 
 
+def _word_count(text: str) -> int:
+    return len(WORD_RE.findall(text or ""))
+
+
+def _split_long_unit(unit: str, max_words: int) -> list[str]:
+    words = WORD_RE.findall(unit or "")
+    if len(words) <= max_words:
+        return [unit.strip()] if unit.strip() else []
+    return [" ".join(words[index : index + max_words]).strip() for index in range(0, len(words), max_words)]
+
+
+def _target_word_budget(target_chars: int) -> tuple[int, int]:
+    normalized_chars = max(1, target_chars)
+    if normalized_chars >= 1200:
+        derived_target = max(WORDS_PER_BLOCK_MIN, min(WORDS_PER_BLOCK_MAX, round(normalized_chars / 5)))
+        return derived_target, max(derived_target, WORDS_PER_BLOCK_MAX)
+    derived_target = max(24, round(normalized_chars / 5))
+    return derived_target, max(derived_target + 12, round(normalized_chars / 4))
+
+
 def build_blocks(text: str, target_chars: int, overlap_chars: int) -> list[TextBlock]:
-    sentences = sentence_segments(text)
-    if not sentences:
+    del overlap_chars
+    units = sentence_segments(text)
+    if not units:
         return []
 
-    if re.search(r"\n{2,}", text or ""):
-        blocks: list[TextBlock] = []
-        cursor = 0
-        for idx, sentence in enumerate(sentences):
-            start = text.find(sentence, cursor)
+    min_words, max_words = _target_word_budget(target_chars)
+    normalized_units: list[tuple[str, int, int, int]] = []
+    cursor = 0
+    for unit in units:
+        for piece in _split_long_unit(unit, LONG_UNIT_WORD_LIMIT):
+            start = text.find(piece, cursor)
             if start < 0:
                 start = cursor
-            end = start + len(sentence)
-            blocks.append(TextBlock(index=idx, text=sentence, start_char=start, end_char=end))
+            end = start + len(piece)
+            normalized_units.append((piece, start, end, _word_count(piece)))
             cursor = end
-        return blocks
 
     blocks: list[TextBlock] = []
-    sentence_positions: list[tuple[str, int, int]] = []
-    cursor = 0
-    for sentence in sentences:
-        start = text.find(sentence, cursor)
-        if start < 0:
-            start = cursor
-        end = start + len(sentence)
-        sentence_positions.append((sentence, start, end))
-        cursor = end
-
     idx = 0
     pointer = 0
-    while pointer < len(sentence_positions):
-        start_char = sentence_positions[pointer][1]
+    while pointer < len(normalized_units):
         collected: list[str] = []
-        end_char = start_char
+        start_char = normalized_units[pointer][1]
+        end_char = normalized_units[pointer][2]
+        word_total = 0
         next_pointer = pointer
-        while next_pointer < len(sentence_positions):
-            sentence, _, sentence_end = sentence_positions[next_pointer]
-            projected = " ".join(collected + [sentence]).strip()
-            if collected and len(projected) > target_chars:
+
+        while next_pointer < len(normalized_units):
+            piece, _, piece_end, piece_words = normalized_units[next_pointer]
+            projected_words = word_total + piece_words
+            if collected and projected_words > max_words and word_total >= min_words:
                 break
-            collected.append(sentence)
-            end_char = sentence_end
+            collected.append(piece)
+            word_total = projected_words
+            end_char = piece_end
             next_pointer += 1
+            if word_total >= max_words:
+                break
+
         block_text = " ".join(collected).strip()
-        blocks.append(
-            TextBlock(index=idx, text=block_text, start_char=start_char, end_char=end_char)
-        )
+        blocks.append(TextBlock(index=idx, text=block_text, start_char=start_char, end_char=end_char))
         idx += 1
-        if next_pointer >= len(sentence_positions):
-            break
-        overlap_start = next_pointer
-        while (
-            overlap_start > pointer
-            and sentence_positions[next_pointer - 1][2]
-            - sentence_positions[overlap_start - 1][1]
-            < overlap_chars
-        ):
-            overlap_start -= 1
-        pointer = max(pointer + 1, overlap_start)
+        pointer = next_pointer
+
     return blocks

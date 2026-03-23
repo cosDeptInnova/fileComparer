@@ -400,4 +400,4 @@ def test_compare_documents_avoids_false_differences_for_equivalent_docx_and_pdf_
 
     assert result.status == "done"
     assert result.rows == []
-    assert result.meta["pairing"]["pair_count"] == 4
+    assert result.meta["pairing"]["pair_count"] == 1

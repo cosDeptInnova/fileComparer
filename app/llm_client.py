@@ -22,6 +22,7 @@ from app.schemas import LLMComparisonResponse
 
 logger = logging.getLogger(__name__)
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+JSON_STRING_BLOCK_RE = re.compile(r'"(\{.*\})"', re.DOTALL)
 EMPTY_PAYLOAD_ERROR = "Payload del LLM vacío."
 STRICT_JSON_ERROR = "No se pudo extraer JSON estricto del mensaje del LLM."
 
@@ -157,14 +158,9 @@ def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
         raise LLMResponseError(EMPTY_PAYLOAD_ERROR)
 
     for candidate in _json_candidates(text):
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, str):
-                data = json.loads(data)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            continue
+        parsed = _parse_json_candidate(candidate)
+        if parsed is not None:
+            return parsed
     raise LLMResponseError(STRICT_JSON_ERROR)
 
 
@@ -231,6 +227,7 @@ def _estimate_text_tokens(text: str) -> int:
 
 def _json_candidates(text: str) -> list[str]:
     clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean = re.sub(r"^json\s*", "", clean, flags=re.IGNORECASE).strip()
     clean = clean.replace("\ufeff", "").strip()
     candidates: list[str] = []
 
@@ -238,6 +235,11 @@ def _json_candidates(text: str) -> list[str]:
         candidates.append(clean)
 
     for match in JSON_BLOCK_RE.finditer(clean):
+        block = match.group(1).strip()
+        if block:
+            candidates.append(block)
+
+    for match in JSON_STRING_BLOCK_RE.finditer(clean):
         block = match.group(1).strip()
         if block:
             candidates.append(block)
@@ -270,3 +272,31 @@ def _extract_balanced_json_objects(text: str) -> list[str]:
         if isinstance(obj, dict):
             candidates.append(text[index : index + end])
     return candidates
+
+
+def _parse_json_candidate(candidate: str) -> dict[str, Any] | None:
+    normalized = (candidate or "").strip()
+    if not normalized:
+        return None
+
+    variants = [normalized]
+    if normalized.startswith('"') and normalized.endswith('"'):
+        variants.append(normalized[1:-1])
+    variants.append(normalized.replace('\\"', '"'))
+
+    for variant in variants:
+        current = variant.strip()
+        if not current:
+            continue
+        try:
+            data = json.loads(current)
+        except Exception:
+            continue
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                continue
+        if isinstance(data, dict):
+            return data
+    return None
