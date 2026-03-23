@@ -17,6 +17,9 @@ from app.settings import settings
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+PAIRING_ALGORITHM = "sequence_alignment"
+MATCH_REWARD_BASELINE = 0.45
+GAP_PENALTY = 0.35
 
 
 @dataclass(slots=True)
@@ -38,6 +41,29 @@ def _token_overlap_score(a: str, b: str) -> float:
     if not set_a or not set_b:
         return 0.0
     return len(set_a & set_b) / len(set_a | set_b)
+
+
+def _relative_length_score(a: str, b: str) -> float:
+    len_a = len(a.strip())
+    len_b = len(b.strip())
+    if not len_a or not len_b:
+        return 0.0
+    return min(len_a, len_b) / max(len_a, len_b)
+
+
+def _relative_position_score(index_a: int, total_a: int, index_b: int, total_b: int) -> float:
+    if total_a <= 1 and total_b <= 1:
+        return 1.0
+    pos_a = 0.0 if total_a <= 1 else index_a / (total_a - 1)
+    pos_b = 0.0 if total_b <= 1 else index_b / (total_b - 1)
+    return max(0.0, 1.0 - abs(pos_a - pos_b))
+
+
+def _block_similarity(block_a: TextBlock, block_b: TextBlock, total_a: int, total_b: int) -> float:
+    overlap = _token_overlap_score(block_a.text, block_b.text)
+    length_score = _relative_length_score(block_a.text, block_b.text)
+    position_score = _relative_position_score(block_a.index, total_a, block_b.index, total_b)
+    return (overlap * 0.6) + (length_score * 0.25) + (position_score * 0.15)
 
 
 def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None = None) -> PreparedDocument:
@@ -76,30 +102,83 @@ def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None =
 
 
 def _pair_blocks(blocks_a: list[TextBlock], blocks_b: list[TextBlock]) -> list[dict[str, Any]]:
-    pairs: list[dict[str, Any]] = []
-    cursor_b = 0
-    for block_a in blocks_a:
-        candidates = []
-        for candidate_index in range(cursor_b, min(len(blocks_b), cursor_b + 4)):
-            block_b = blocks_b[candidate_index]
-            score = _token_overlap_score(block_a.text, block_b.text)
-            candidates.append((score, candidate_index, block_b))
-        if candidates:
-            best_score, best_index, best_block_b = max(candidates, key=lambda item: item[0])
-            if best_score > 0.08:
-                pairs.append(
-                    {
-                        "a": block_a,
-                        "b": best_block_b,
-                        "alignment_score": best_score,
-                        "reanchored": best_index != cursor_b,
-                    }
-                )
-                cursor_b = best_index + 1
-                continue
-        pairs.append({"a": block_a, "b": None, "alignment_score": 0.0, "reanchored": True})
-    for orphan in blocks_b[cursor_b:]:
-        pairs.append({"a": None, "b": orphan, "alignment_score": 0.0, "reanchored": True})
+    total_a = len(blocks_a)
+    total_b = len(blocks_b)
+    dp = [[0.0] * (total_b + 1) for _ in range(total_a + 1)]
+    direction = [["start"] * (total_b + 1) for _ in range(total_a + 1)]
+
+    for index_a in range(1, total_a + 1):
+        dp[index_a][0] = dp[index_a - 1][0] - GAP_PENALTY
+        direction[index_a][0] = "up"
+    for index_b in range(1, total_b + 1):
+        dp[0][index_b] = dp[0][index_b - 1] - GAP_PENALTY
+        direction[0][index_b] = "left"
+
+    for index_a in range(1, total_a + 1):
+        for index_b in range(1, total_b + 1):
+            block_a = blocks_a[index_a - 1]
+            block_b = blocks_b[index_b - 1]
+            similarity = _block_similarity(block_a, block_b, total_a, total_b)
+            diagonal = dp[index_a - 1][index_b - 1] + ((similarity * 2) - 1 - MATCH_REWARD_BASELINE)
+            up = dp[index_a - 1][index_b] - GAP_PENALTY
+            left = dp[index_a][index_b - 1] - GAP_PENALTY
+            best_score = max(diagonal, up, left)
+            dp[index_a][index_b] = best_score
+            if best_score == diagonal:
+                direction[index_a][index_b] = "diag"
+            elif best_score == up:
+                direction[index_a][index_b] = "up"
+            else:
+                direction[index_a][index_b] = "left"
+
+    raw_pairs: list[dict[str, Any]] = []
+    index_a = total_a
+    index_b = total_b
+    while index_a > 0 or index_b > 0:
+        move = direction[index_a][index_b]
+        if move == "diag" and index_a > 0 and index_b > 0:
+            block_a = blocks_a[index_a - 1]
+            block_b = blocks_b[index_b - 1]
+            raw_pairs.append(
+                {
+                    "a": block_a,
+                    "b": block_b,
+                    "alignment_score": _block_similarity(block_a, block_b, total_a, total_b),
+                }
+            )
+            index_a -= 1
+            index_b -= 1
+            continue
+        if (move == "up" and index_a > 0) or index_b == 0:
+            raw_pairs.append({"a": blocks_a[index_a - 1], "b": None, "alignment_score": 0.0})
+            index_a -= 1
+            continue
+        raw_pairs.append({"a": None, "b": blocks_b[index_b - 1], "alignment_score": 0.0})
+        index_b -= 1
+
+    pairs = list(reversed(raw_pairs))
+    last_matched_a: int | None = None
+    last_matched_b: int | None = None
+    for pair in pairs:
+        block_a = pair["a"]
+        block_b = pair["b"]
+        if block_a is None:
+            pair["pair_type"] = "orphan_b"
+            pair["reanchored"] = False
+            continue
+        if block_b is None:
+            pair["pair_type"] = "orphan_a"
+            pair["reanchored"] = False
+            continue
+        reanchored = False
+        if last_matched_a is None or last_matched_b is None:
+            reanchored = block_a.index != 0 or block_b.index != 0
+        else:
+            reanchored = (block_a.index != last_matched_a + 1) or (block_b.index != last_matched_b + 1)
+        pair["pair_type"] = "reanchored" if reanchored else "matched"
+        pair["reanchored"] = reanchored
+        last_matched_a = block_a.index
+        last_matched_b = block_b.index
     return pairs
 
 
@@ -158,6 +237,12 @@ def compare_documents(
     prepared_a = prepare_document(path_a, extraction=extraction)
     prepared_b = prepare_document(path_b, extraction=extraction)
     pairs = _pair_blocks(prepared_a.segments, prepared_b.segments)
+    pairing_counts = {
+        "matched_pairs": sum(1 for pair in pairs if pair["pair_type"] == "matched"),
+        "orphan_a": sum(1 for pair in pairs if pair["pair_type"] == "orphan_a"),
+        "orphan_b": sum(1 for pair in pairs if pair["pair_type"] == "orphan_b"),
+        "reanchored_pairs": sum(1 for pair in pairs if pair["pair_type"] == "reanchored"),
+    }
     rows: list[ChangeRow] = []
     for index, pair in enumerate(pairs, start=1):
         block_a = pair["a"]
@@ -185,7 +270,9 @@ def compare_documents(
                     offset_end_b=0 if block_b is None else block_b.end_char,
                     pairing={
                         "alignment_score": pair["alignment_score"],
-                        "strategy": "correlative_window_overlap",
+                        "strategy": pair["pair_type"],
+                        "pair_type": pair["pair_type"],
+                        "algorithm": PAIRING_ALGORITHM,
                         "reanchored": pair["reanchored"],
                     },
                     source_spans={
@@ -233,7 +320,11 @@ def compare_documents(
                 "doc_b_blocks": len(prepared_b.segments),
             },
             "extraction": asdict(extraction),
-            "pairing": {"strategy": "correlative_window_overlap", "pair_count": len(pairs)},
+            "pairing": {
+                "strategy": PAIRING_ALGORITHM,
+                "pair_count": len(pairs),
+                **pairing_counts,
+            },
             "documents": {
                 "a": prepared_a.document.model_dump(),
                 "b": prepared_b.document.model_dump(),
