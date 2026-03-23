@@ -14,8 +14,20 @@ except Exception as exc:  # pragma: no cover - allows import without redis in li
 else:
     _REDIS_IMPORT_ERROR = None
 
-from app.services.rq_compat import load_rq_runtime
+from app.celery_app import celery_app
 from app.settings import settings
+
+
+class CeleryQueue:
+    def __init__(self, name: str):
+        self.name = name
+
+    def enqueue(self, func: Any, *args: object, job_id: str | None = None, **kwargs: object):
+        if not hasattr(func, "apply_async"):
+            raise RuntimeError(
+                f"La tarea {getattr(func, '__name__', func)!r} no está registrada como task de Celery."
+            )
+        return func.apply_async(args=args, kwargs=kwargs, task_id=job_id, queue=self.name)
 
 
 def _decode_if_bytes(value: Any) -> str:
@@ -46,39 +58,26 @@ def _require_queue_connection(connection: Redis | None = None) -> Redis:
     return conn
 
 
-def _worker_queue_names(worker: Any) -> set[str]:
-    if hasattr(worker, "queue_names"):
-        try:
-            names = worker.queue_names()
-            return {str(name) for name in names}
-        except Exception:  # noqa: BLE001
-            pass
-
-    queues = getattr(worker, "queues", None) or []
+def _active_queue_names(record: Any) -> set[str]:
     names: set[str] = set()
-    for queue in queues:
-        queue_name = getattr(queue, "name", None)
-        if queue_name:
-            names.add(str(queue_name))
+    if isinstance(record, list):
+        for queue_data in record:
+            if isinstance(queue_data, dict) and queue_data.get("name"):
+                names.add(str(queue_data["name"]))
     return names
 
 
 def count_queue_workers(queue_name: str, *, connection: Redis | None = None) -> int:
-    conn = _require_queue_connection(connection)
-    worker_cls = load_rq_runtime()["Worker"]
-    if worker_cls is None or not hasattr(worker_cls, "all"):
-        return 0
-
+    _require_queue_connection(connection)
     try:
-        workers = worker_cls.all(connection=conn)
-    except TypeError:
-        workers = worker_cls.all(conn)
+        inspector = celery_app.control.inspect(timeout=settings.celery_inspect_timeout_seconds)
+        active_queues = inspector.active_queues() or {}
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"No se pudo consultar los workers RQ activos: {exc}") from exc
+        raise RuntimeError(f"No se pudo consultar los workers Celery activos: {exc}") from exc
 
     active = 0
-    for worker in workers or []:
-        if queue_name in _worker_queue_names(worker):
+    for worker_data in active_queues.values():
+        if queue_name in _active_queue_names(worker_data):
             active += 1
     return active
 
@@ -87,24 +86,19 @@ def ensure_queue_backend_ready(*, require_active_workers: bool | None = None, co
     conn = _require_queue_connection(connection)
     must_have_workers = settings.require_active_workers if require_active_workers is None else require_active_workers
     if must_have_workers:
-        worker_count = count_queue_workers(settings.rq_queue_name, connection=conn)
+        worker_count = count_queue_workers(settings.compare_queue_name, connection=conn)
         if worker_count < 1:
             raise RuntimeError(
-                "No hay workers RQ activos escuchando la cola de comparación. "
+                "No hay workers Celery activos escuchando la cola de comparación. "
                 "Arranca comp_docs_worker antes de invocar /comparar. "
-                f"Queue={settings.rq_queue_name!r} Redis={settings.redis_url!r}."
+                f"Queue={settings.compare_queue_name!r} Redis={settings.redis_url!r}."
             )
     return conn
 
 
-def compare_queue():
-    queue_class = load_rq_runtime()["Queue"]
-    connection = ensure_queue_backend_ready(require_active_workers=False)
-    return queue_class(
-        settings.rq_queue_name,
-        connection=connection,
-        default_timeout=int(settings.llm_timeout_seconds * 4),
-    )
+def compare_queue() -> CeleryQueue:
+    ensure_queue_backend_ready(require_active_workers=False)
+    return CeleryQueue(settings.compare_queue_name)
 
 
 def job_key(sid: str) -> str:

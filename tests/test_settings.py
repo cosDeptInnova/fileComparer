@@ -66,27 +66,28 @@ def test_read_job_state_decodes_bytes(monkeypatch):
     assert state == {"status": "done", "percent": 100, "progress": {"detail": "ok"}}
 
 
-class DummyQueue:
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
+class DummyTask:
+    def __init__(self):
+        self.calls = []
+
+    def apply_async(self, args=(), kwargs=None, task_id=None, queue=None):
+        self.calls.append({"args": args, "kwargs": kwargs or {}, "task_id": task_id, "queue": queue})
+        return {"queued": True}
 
 
-def test_compare_queue_imports_rq_lazily(monkeypatch):
-    import types
-    import sys
-
-    rq_mod = types.ModuleType("rq")
-    rq_mod.Queue = DummyQueue
-    monkeypatch.setitem(sys.modules, "rq", rq_mod)
+def test_compare_queue_dispatches_celery_task(monkeypatch):
     fake_connection = object()
     monkeypatch.setattr(queue_module, "redis_connection", lambda: fake_connection)
 
     queue = queue_module.compare_queue()
+    task = DummyTask()
 
-    assert isinstance(queue, DummyQueue)
-    assert queue.args == (queue_module.settings.rq_queue_name,)
-    assert queue.kwargs == {
-        "connection": fake_connection,
-        "default_timeout": int(queue_module.settings.llm_timeout_seconds * 4),
-    }
+    result = queue.enqueue(task, "sid-1", "/tmp/a", "/tmp/b", job_id="sid-1", engine="auto")
+
+    assert result == {"queued": True}
+    assert task.calls == [{
+        "args": ("sid-1", "/tmp/a", "/tmp/b"),
+        "kwargs": {"engine": "auto"},
+        "task_id": "sid-1",
+        "queue": queue_module.settings.compare_queue_name,
+    }]

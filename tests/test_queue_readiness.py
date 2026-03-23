@@ -13,18 +13,27 @@ from app.main import app
 from app.settings import settings
 
 
-class DummyWorkerRecord:
-    def __init__(self, *queue_names: str):
-        self._queue_names = queue_names
+class DummyInspect:
+    def __init__(self, payload):
+        self.payload = payload
 
-    def queue_names(self):
-        return list(self._queue_names)
+    def active_queues(self):
+        return self.payload
 
 
-class DummyWorkerClass:
-    @staticmethod
-    def all(connection=None):
-        return [DummyWorkerRecord("compare"), DummyWorkerRecord("other")]
+class DummyControl:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def inspect(self, timeout=None):
+        self.calls.append(timeout)
+        return DummyInspect(self.payload)
+
+
+class DummyCeleryApp:
+    def __init__(self, payload):
+        self.control = DummyControl(payload)
 
 
 class DummyRedis:
@@ -36,9 +45,19 @@ def test_count_queue_workers_filters_by_queue(monkeypatch):
     from app.services import queue as queue_module
 
     monkeypatch.setattr(queue_module, "redis_connection", lambda: DummyRedis())
-    monkeypatch.setattr(queue_module, "load_rq_runtime", lambda: {"Worker": DummyWorkerClass, "Queue": object})
+    monkeypatch.setattr(
+        queue_module,
+        "celery_app",
+        DummyCeleryApp(
+            {
+                "worker-a": [{"name": "compare"}],
+                "worker-b": [{"name": "other"}],
+                "worker-c": [{"name": "compare"}, {"name": "priority"}],
+            }
+        ),
+    )
 
-    assert queue_module.count_queue_workers("compare") == 1
+    assert queue_module.count_queue_workers("compare") == 2
     assert queue_module.count_queue_workers("missing") == 0
 
 
@@ -59,7 +78,7 @@ def test_compare_endpoint_returns_503_when_workers_are_required(monkeypatch, tmp
     monkeypatch.setattr(
         comparar_route,
         "ensure_queue_backend_ready",
-        lambda require_active_workers=True: (_ for _ in ()).throw(RuntimeError("No hay workers RQ activos")),
+        lambda require_active_workers=True: (_ for _ in ()).throw(RuntimeError("No hay workers Celery activos")),
     )
 
     client = TestClient(app)
@@ -77,5 +96,5 @@ def test_compare_endpoint_returns_503_when_workers_are_required(monkeypatch, tmp
     )
 
     assert response.status_code == 503
-    assert "workers RQ activos" in response.json()["detail"]
+    assert "workers Celery activos" in response.json()["detail"]
     assert any(state.get("status") == "error" for state in state_store.values())

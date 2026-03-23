@@ -46,7 +46,23 @@ class Settings:
     upload_dir_name: str = "inputs"
     result_file_name: str = "result.json"
     redis_url: str = _env("REDIS_URL", default="redis://127.0.0.1:6379/0")
-    rq_queue_name: str = _env("COMPARE_QUEUE_NAME", default="compare")
+    compare_queue_name: str = _env("COMPARE_QUEUE_NAME", default="compare")
+    celery_broker_url: str = _env(
+        "COMPARE_CELERY_BROKER_URL",
+        "CELERY_BROKER_URL",
+        "REDIS_URL",
+        default="redis://127.0.0.1:6379/0",
+    )
+    celery_result_backend: str = _env(
+        "COMPARE_CELERY_RESULT_BACKEND",
+        "CELERY_RESULT_BACKEND",
+        "REDIS_URL",
+        default="redis://127.0.0.1:6379/0",
+    )
+    celery_inspect_timeout_seconds: float = _env_float(
+        "COMPARE_CELERY_INSPECT_TIMEOUT_SECONDS",
+        default=1.5,
+    )
     inline_jobs: bool = _env_bool("COMPARE_INLINE_JOBS", default=False)
     require_active_workers: bool = _env_bool("COMPARE_REQUIRE_ACTIVE_WORKERS", default=False)
     queue_pop_timeout_seconds: int = _env_int("COMPARE_QUEUE_POP_TIMEOUT_SECONDS", default=5)
@@ -83,6 +99,10 @@ class Settings:
     llm_temperature: float = _env_float("LLAMA_CPP_TEMPERATURE", default=0)
     llm_max_tokens: int = _env_int("LLAMA_CPP_MAX_TOKENS", default=1800)
     csrf_cookie_name: str = _env("COMPARE_CSRF_COOKIE", default="csrftoken_app")
+
+    @property
+    def rq_queue_name(self) -> str:
+        return self.compare_queue_name
 
     @property
     def max_file_bytes(self) -> int:

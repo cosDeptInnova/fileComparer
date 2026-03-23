@@ -74,7 +74,7 @@ Servicio `comp_docs` y worker dedicado
 --------------------------------------
 Para `comp_docs` ahora existen dos entradas gestionadas por scripts y apuntan al worker real:
 - `comp_docs` -> proceso web FastAPI en el puerto 8007
-- `comp_docs_worker` -> worker dedicado del comparador (`python -m app.worker`)
+- `comp_docs_worker` -> worker dedicado del comparador (Celery; `python -m app.worker`)
 
 Al arrancar `comp_docs` con `start-service.ps1`, el script también levanta automáticamente
 su servicio compañero `comp_docs_worker`. El arranque es idempotente: si el worker ya
@@ -104,7 +104,7 @@ Las variables operativas relevantes son, entre otras:
 - `COMPARE_OCR_TIMEOUT_SECONDS`
 - `COMPARE_LLM_TIMEOUT_SECONDS`
 
-`comp_docs_worker` arranca con `ProcessCount=4`, `COMPARE_WORKER_CONCURRENCY=1` y `MAX_CONCURRENT_JOBS=4` por defecto. Puedes cambiar el número de procesos en `scripts\services.psd1` o en tiempo de arranque con `-CompDocsWorkerCount`; para RQ en Windows, `-CompDocsWorkerConcurrency` se traduce en número de procesos porque cada worker atiende 1 job a la vez.
+`comp_docs_worker` arranca con `ProcessCount=1`, `COMPARE_WORKER_CONCURRENCY=4` y `MAX_CONCURRENT_JOBS=4` por defecto. Puedes cambiar el número de procesos en `scripts\services.psd1` o en tiempo de arranque con `-CompDocsWorkerCount`; para Celery, `-CompDocsWorkerConcurrency` controla la concurrencia interna por worker y `-CompDocsWorkerCount` el número de instancias del servicio.
 
 
 6. Gestión robusta de puertos

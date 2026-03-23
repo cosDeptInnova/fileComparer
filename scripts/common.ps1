@@ -269,21 +269,19 @@ function Set-CompDocsWorkerScaling {
     $workerSvc.Env = @{}
   }
 
-  # Con RQ, cada proceso worker atiende 1 job cada vez.
-  # Para mantener el control desde los scripts existentes:
-  # - WorkerCount controla el número real de procesos worker.
-  # - WorkerConcurrency, si se informa sin WorkerCount, se interpreta como número deseado de procesos.
+  # Con Celery, WorkerCount controla el número de instancias del servicio y
+  # WorkerConcurrency la concurrencia interna de cada worker.
   $configuredWorkerCount = Get-ServiceInstanceCount -Svc $workerSvc
   $effectiveWorkerCount = if ($WorkerCount -gt 0) { $WorkerCount } else { $configuredWorkerCount }
   if ($effectiveWorkerCount -le 0) { $effectiveWorkerCount = 1 }
-  if ($WorkerCount -le 0 -and $WorkerConcurrency -gt 0) {
-    $effectiveWorkerCount = $WorkerConcurrency
-  }
 
-  $effectiveConcurrency = 1
-  $totalInflight = [Math]::Max(1, $effectiveWorkerCount)
+  $configuredConcurrency = [int](Try-GetProp -Obj $workerSvc.Env -Name "COMPARE_WORKER_CONCURRENCY" -Default "1")
+  $effectiveConcurrency = if ($WorkerConcurrency -gt 0) { $WorkerConcurrency } else { $configuredConcurrency }
+  if ($effectiveConcurrency -le 0) { $effectiveConcurrency = 1 }
 
-  $workerSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "rq"
+  $totalInflight = [Math]::Max(1, ($effectiveWorkerCount * $effectiveConcurrency))
+
+  $workerSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "celery"
   $workerSvc.Env.COMPARE_WORKER_CONCURRENCY = [string]$effectiveConcurrency
   $workerSvc.Env.COMPARE_WORKER_COUNT = [string]$effectiveWorkerCount
   $workerSvc.Env.MAX_CONCURRENT_JOBS = [string]$totalInflight
@@ -294,7 +292,7 @@ function Set-CompDocsWorkerScaling {
     if (-not (Try-GetProp -Obj $webSvc -Name "Env" -Default $null)) {
       $webSvc.Env = @{}
     }
-    $webSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "rq"
+    $webSvc.Env.COMPARE_WORKER_IMPLEMENTATION = "celery"
     $webSvc.Env.COMPARE_WORKER_COUNT = [string]$effectiveWorkerCount
     $webSvc.Env.MAX_CONCURRENT_JOBS = [string]$totalInflight
     $webSvc.Env.COMPARE_MAX_INFLIGHT_JOBS = [string]$totalInflight

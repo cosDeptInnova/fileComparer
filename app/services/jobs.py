@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from app.celery_app import celery_app
 from app.schemas import ComparisonResult
 from app.services.comparison_pipeline import ExtractionOptions, compare_documents
 from app.services.queue import persist_job_result, update_job_state
@@ -13,6 +14,7 @@ def _has_useful_result_data(result: ComparisonResult) -> bool:
     return bool(result.rows) or bool(result.meta) or bool(result.error)
 
 
+@celery_app.task(name="app.services.jobs.run_compare_job")
 def run_compare_job(
     sid: str,
     path_a: str,
