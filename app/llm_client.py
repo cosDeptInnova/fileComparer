@@ -1,191 +1,339 @@
+# cosmos_mcp/services/llm_client.py
+
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import Callable
-import os
-import time
+from typing import Any, Dict, Optional
 import uuid
-from typing import Any
-
 import httpx
+import time
 
-from .llm_runtime import DEFAULT_LLAMA_BASE_URL, DEFAULT_MODEL_NAME, resolve_llm_runtime_settings
-from .metrics import observe_inference_concurrency, observe_llm_duration
-from .runtime_controls import RedisSlotSemaphore
+from app.core import settings
+from models.inference import ChatCompletionRequest
 
-LOGGER = logging.getLogger(__name__)
-DEFAULT_TIMEOUT_SECONDS = 120.0
+logger = logging.getLogger(__name__)
 
+try:
+    from observability.metrics import (
+    LLM_REQUESTS_TOTAL,
+    LLM_ERRORS_TOTAL,
+    LLM_INFLIGHT,
+    LLM_LATENCY_SECONDS,
+    LLM_TOKENS_TOTAL,
+    LLM_TOKENS_PER_REQUEST,
+    LLM_USAGE_MISSING_TOTAL,
+)
+    _METRICS_ENABLED = True
+except Exception:
+    _METRICS_ENABLED = False
 
-class CompareInferenceAborted(RuntimeError):
-    """Raised when a compare job reached a terminal state before another inference call."""
+# Fallback explícito al puerto donde tienes corriendo llama-server
+DEFAULT_LLAMA_BASE_URL = "http://127.0.0.1:8002/v1"
 
 
 class LLMClient:
-    """Cliente reutilizable para llama.cpp / endpoints OpenAI-compatible."""
+    """
+    Cliente asincrónico para un servidor llama.cpp con API OpenAI-compatible.
+
+    - Usa httpx.AsyncClient con base_url tipo "http://127.0.0.1:8002/v1".
+    - Reutiliza la conexión entre peticiones.
+    """
 
     def __init__(
         self,
-        *,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        timeout: float | None = None,
-        model_name: str | None = None,
-        sync_client=None,
-        inference_semaphore: RedisSlotSemaphore | None = None,
-        should_abort: Callable[[], bool] | None = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> None:
-        runtime = resolve_llm_runtime_settings()
-        self.base_url = str(base_url or runtime.get("base_url") or DEFAULT_LLAMA_BASE_URL).rstrip("/")
-        self.api_key = str(api_key or runtime.get("api_key") or "").strip()
-        self.timeout = float(timeout or DEFAULT_TIMEOUT_SECONDS)
-        self.model_name = str(model_name or runtime.get("model_name") or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
-        self._client: httpx.Client | None = None
-        max_inference = max(1, int(os.getenv("COMPARE_MAX_INFERENCE_CONCURRENCY", "1")))
-        self.should_abort = should_abort
-        self.inference_semaphore = inference_semaphore or RedisSlotSemaphore(
-            sync_client,
-            name=os.getenv("COMPARE_INFERENCE_SEMAPHORE_KEY", "compare:inference"),
-            slots=max_inference,
-            ttl_seconds=int(os.getenv("COMPARE_INFERENCE_SEMAPHORE_TTL_SECONDS", "900")),
-            wait_sleep_seconds=float(os.getenv("COMPARE_INFERENCE_WAIT_SLEEP_SECONDS", "0.05")),
+        effective_base = (
+            base_url
+            or getattr(settings, "LLAMA_SERVER_BASE_URL", None)
+            or DEFAULT_LLAMA_BASE_URL
         )
+        self._base_url = effective_base.rstrip("/")
+        self._api_key = api_key or getattr(settings, "LLAMA_SERVER_API_KEY", None)
+        self._timeout = timeout or getattr(settings, "LLAMA_REQUEST_TIMEOUT", 60.0)
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def startup(self) -> None:
+    async def startup(self) -> None:
+        """Inicializa el cliente HTTP (se llama en el lifespan de FastAPI)."""
         if self._client is None:
-            self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
+            logger.info("Inicializando LLMClient con base_url=%s", self._base_url)
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout,
+            )
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
+        """Cierra el cliente HTTP."""
         if self._client is not None:
-            self._client.close()
+            logger.info("Cerrando LLMClient")
+            await self._client.aclose()
             self._client = None
 
-    def __enter__(self) -> "LLMClient":
-        self.startup()
-        return self
+    # ------------------------------------------------------------------
+    # Helpers internos
+    # ------------------------------------------------------------------
+    def _build_headers(self) -> Dict[str, str]:
+        """
+        Construye los headers a enviar a llama.cpp.
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.shutdown()
+        Punto crítico: httpx exige que las cabeceras sean ASCII. Si la API key
+        tiene acentos u otros caracteres no-ASCII, evitamos reventar con
+        UnicodeEncodeError y simplemente NO enviamos Authorization.
+        """
+        headers: Dict[str, str] = {}
 
-    def _headers(self) -> dict[str, str] | None:
-        if not self.api_key:
-            return None
-        return {"Authorization": f"Bearer {self.api_key}"}
+        if self._api_key:
+            auth_value = f"Bearer {self._api_key}"
+            try:
+                # Validamos que sea ASCII-safe
+                auth_value.encode("ascii")
+            except UnicodeEncodeError:
+                logger.error(
+                    "LLAMA_SERVER_API_KEY contiene caracteres no ASCII; "
+                    "se omite el header Authorization para evitar errores de codificación."
+                )
+            else:
+                headers["Authorization"] = auth_value
 
-    def _raise_if_aborted(self, *, stage: str) -> None:
-        if callable(self.should_abort) and self.should_abort():
-            LOGGER.info(
-                "LLM compare request aborted before stage=%s model=%s base_url=%s",
-                stage,
-                self.model_name,
-                self.base_url,
-            )
-            raise CompareInferenceAborted(f"compare_inference_aborted:{stage}")
+        return headers
 
-    def chat_completion(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        temperature: float = 0.0,
-        max_tokens: int = 700,
-        schema: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Llamada principal al modelo
+    # ------------------------------------------------------------------
+    async def chat_completion(self, request: ChatCompletionRequest) -> Dict[str, Any]:
+        """
+        Llama al endpoint /chat/completions de llama.cpp.
+
+        Devuelve el JSON completo tal cual responde llama.cpp.
+        """
         if self._client is None:
-            self.startup()
-        self._raise_if_aborted(stage="before_request_build")
-        request_id = uuid.uuid4().hex[:8]
-        payload: dict[str, Any] = {
-            "model": self.model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": False,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
-        if schema:
-            payload["extra_body"] = {"json_schema": schema}
-        started = time.perf_counter()
-        lease = self.inference_semaphore.acquire(
-            timeout_seconds=float(os.getenv("COMPARE_INFERENCE_ACQUIRE_TIMEOUT_SECONDS", "600"))
+            raise RuntimeError("LLMClient no inicializado. Llama a startup() primero.")
+
+        # ID único por llamada para seguirla en logs
+        call_id = uuid.uuid4().hex[:8]
+
+        headers = self._build_headers()
+        payload = request.to_payload()
+
+        messages = payload.get("messages", []) or []
+        model = payload.get("model")
+        max_tokens = payload.get("max_tokens")
+        temperature = payload.get("temperature")
+
+        # Log de alto nivel de la llamada
+        logger.info(
+            "[LLM_CALL %s] → llama.cpp /chat/completions "
+            "(model=%s, n_messages=%d, max_tokens=%s, temperature=%s)",
+            call_id,
+            model,
+            len(messages),
+            max_tokens,
+            temperature,
         )
-        if self.inference_semaphore.enabled() and lease is None:
-            raise TimeoutError("compare_inference_slot_timeout")
-        try:
-            self._raise_if_aborted(stage="before_http_post")
-            observe_inference_concurrency(self.inference_semaphore.active_count())
-            response = self._client.post("/chat/completions", json=payload, headers=self._headers())
-            LOGGER.info(
-                "LLM compare request %s finished in %.3fs status=%s active_inference=%s lease=%s",
-                request_id,
-                time.perf_counter() - started,
-                response.status_code,
-                self.inference_semaphore.active_count(),
-                bool(lease),
+
+        # Detalle del payload solo en DEBUG para no reventar logs
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[LLM_CALL %s] payload (truncado)=%r",
+                call_id,
+                str(payload)[:2000],
             )
-            response.raise_for_status()
-            return response.json()
-        finally:
-            self.inference_semaphore.release(lease)
+            for i, m in enumerate(messages):
+                content = m.get("content", "") or ""
+                logger.debug(
+                    "[LLM_CALL %s] msg[%d] role=%s len=%d: %r",
+                    call_id,
+                    i,
+                    m.get("role"),
+                    len(content),
+                    content[:500],
+                )
 
-    def chat_json(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        schema: dict[str, Any] | None = None,
-        temperature: float = 0.0,
-        max_tokens: int = 700,
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        outcome = "invalid_json"
+        start = time.perf_counter()
+        backend = "unknown"
+        moved_inflight = False
+        recorded = False
+
+        if _METRICS_ENABLED:
+            # Al inicio todavía no sabemos el backend real; Nginx lo devuelve en headers
+            LLM_INFLIGHT.labels(backend="unknown").inc()
+
         try:
-            payload = self.chat_completion(messages=messages, schema=schema, temperature=temperature, max_tokens=max_tokens)
-            data = _extract_json_message(payload)
-            outcome = "ok"
+            response = await self._client.post(
+                "chat/completions",
+                json=payload,
+                headers=headers or None,
+            )
+
+            # Backend real: lo añade tu Nginx (X-LLM-Backend)
+            backend = (response.headers.get("X-LLM-Backend") or "unknown").strip() or "unknown"
+
+            # Transferimos inflight de "unknown" -> backend real (una sola vez)
+            if _METRICS_ENABLED and not moved_inflight:
+                LLM_INFLIGHT.labels(backend="unknown").dec()
+                LLM_INFLIGHT.labels(backend=backend).inc()
+                moved_inflight = True
+
+            logger.info(
+                "[LLM_CALL %s] ← llama.cpp status=%s",
+                call_id,
+                response.status_code,
+            )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[LLM_CALL %s] raw_response (truncado)=%s",
+                    call_id,
+                    response.text[:2000],
+                )
+
+            # Si hay error HTTP aquí, saltará a except HTTPStatusError
+            response.raise_for_status()
+
+            # Intentamos parsear JSON
+            try:
+                data = response.json()
+            except ValueError:
+                logger.error(
+                    "[LLM_CALL %s] Respuesta de llama.cpp no es JSON. Status=%s, body=%s",
+                    call_id,
+                    response.status_code,
+                    response.text,
+                )
+                if _METRICS_ENABLED:
+                    dur = time.perf_counter() - start
+                    LLM_ERRORS_TOTAL.labels(backend=backend, kind="json").inc()
+                    LLM_REQUESTS_TOTAL.labels(backend=backend, status_class="5xx").inc()
+                    LLM_LATENCY_SECONDS.labels(backend=backend).observe(dur)
+                    recorded = True
+                raise httpx.HTTPStatusError(
+                    "Non-JSON response from llama.cpp",
+                    request=response.request,
+                    response=response,
+                )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[LLM_CALL %s] parsed_json (truncado)=%s",
+                    call_id,
+                    str(data)[:2000],
+                )
+
+            #Métricas de éxito
+            if _METRICS_ENABLED and not recorded:
+                dur = time.perf_counter() - start
+                status_class = f"{response.status_code // 100}xx"
+                LLM_REQUESTS_TOTAL.labels(backend=backend, status_class=status_class).inc()
+                LLM_LATENCY_SECONDS.labels(backend=backend).observe(dur)
+
+                usage = data.get("usage") or {}
+                pt = usage.get("prompt_tokens")
+                ct = usage.get("completion_tokens")
+                tt = usage.get("total_tokens")
+
+                if not usage:
+                    LLM_USAGE_MISSING_TOTAL.labels(backend=backend).inc()
+
+                if isinstance(pt, int):
+                    LLM_TOKENS_TOTAL.labels(backend=backend, type="prompt").inc(pt)
+                    LLM_TOKENS_PER_REQUEST.labels(backend=backend, type="prompt").observe(pt)
+
+                if isinstance(ct, int):
+                    LLM_TOKENS_TOTAL.labels(backend=backend, type="completion").inc(ct)
+                    LLM_TOKENS_PER_REQUEST.labels(backend=backend, type="completion").observe(ct)
+
+                if isinstance(tt, int):
+                    LLM_TOKENS_TOTAL.labels(backend=backend, type="total").inc(tt)
+                    LLM_TOKENS_PER_REQUEST.labels(backend=backend, type="total").observe(tt)
+
+
+                recorded = True
+
             return data
-        except Exception:
-            outcome = "error"
+
+        except httpx.HTTPStatusError as http_err:
+            # Backend puede estar disponible en headers aunque haya error
+            try:
+                resp = http_err.response
+                if resp is not None:
+                    backend = (resp.headers.get("X-LLM-Backend") or backend or "unknown").strip() or "unknown"
+            except Exception:
+                backend = backend or "unknown"
+
+            logger.error(
+                "[LLM_CALL %s] Error HTTP llamando a llama.cpp: "
+                "status=%s url=%s body=%s",
+                call_id,
+                http_err.response.status_code if http_err.response is not None else "N/A",
+                str(http_err.request.url) if http_err.request is not None else "N/A",
+                http_err.response.text if http_err.response is not None else "",
+            )
+
+            if _METRICS_ENABLED and not recorded:
+                dur = time.perf_counter() - start
+                status_code = http_err.response.status_code if http_err.response is not None else 500
+                status_class = f"{status_code // 100}xx"
+                LLM_ERRORS_TOTAL.labels(backend=backend, kind="http_status").inc()
+                LLM_REQUESTS_TOTAL.labels(backend=backend, status_class=status_class).inc()
+                LLM_LATENCY_SECONDS.labels(backend=backend).observe(dur)
+                recorded = True
+
             raise
+
+        except httpx.RequestError as req_err:
+            logger.error(
+                "[LLM_CALL %s] Error de red llamando a llama.cpp: %s",
+                call_id,
+                req_err,
+            )
+
+            if _METRICS_ENABLED and not recorded:
+                dur = time.perf_counter() - start
+                LLM_ERRORS_TOTAL.labels(backend=backend or "unknown", kind="network").inc()
+                LLM_REQUESTS_TOTAL.labels(backend=backend or "unknown", status_class="5xx").inc()
+                LLM_LATENCY_SECONDS.labels(backend=backend or "unknown").observe(dur)
+                recorded = True
+
+            raise
+
+        except Exception:
+            # Cualquier excepción inesperada: no altera el flujo, solo contabiliza si hay métricas
+            logger.exception("[LLM_CALL %s] Error inesperado en chat_completion()", call_id)
+            if _METRICS_ENABLED and not recorded:
+                dur = time.perf_counter() - start
+                LLM_ERRORS_TOTAL.labels(backend=backend or "unknown", kind="unknown").inc()
+                LLM_REQUESTS_TOTAL.labels(backend=backend or "unknown", status_class="5xx").inc()
+                LLM_LATENCY_SECONDS.labels(backend=backend or "unknown").observe(dur)
+                recorded = True
+            raise
+
         finally:
-            observe_llm_duration(time.perf_counter() - started, outcome=outcome)
-            observe_inference_concurrency(self.inference_semaphore.active_count())
+            if _METRICS_ENABLED:
+                # Si hicimos transfer a backend real, decrementa ese; si no, decrementa unknown
+                try:
+                    if moved_inflight:
+                        LLM_INFLIGHT.labels(backend=backend or "unknown").dec()
+                    else:
+                        LLM_INFLIGHT.labels(backend="unknown").dec()
+                except Exception:
+                    # Nunca romper por métricas
+                    pass
 
+    async def health_check(self) -> bool:
+        """
+        Comprueba que llama.cpp está vivo.
 
-def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("llm_invalid_payload")
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0] or {}
-        message = first.get("message") if isinstance(first, dict) else None
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, dict):
-                if isinstance(content.get("json"), dict):
-                    return content["json"]
-                content = content.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip():
-                        return json.loads(item["text"])
-            if isinstance(content, str) and content.strip():
-                return json.loads(content)
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tool in tool_calls:
-                    fn = tool.get("function") if isinstance(tool, dict) else None
-                    args = fn.get("arguments") if isinstance(fn, dict) else None
-                    if isinstance(args, str) and args.strip():
-                        return json.loads(args)
-        text = first.get("text") if isinstance(first, dict) else None
-        if isinstance(text, str) and text.strip():
-            return json.loads(text)
-    output = payload.get("output")
-    if isinstance(output, list):
-        for item in output:
-            content = item.get("content") if isinstance(item, dict) else None
-            if isinstance(content, list):
-                for subitem in content:
-                    if isinstance(subitem, dict) and isinstance(subitem.get("text"), str) and subitem.get("text").strip():
-                        return json.loads(subitem["text"])
-    raise ValueError("llm_invalid_json")
+        Intenta una petición rápida (GET /health). Si falla, devuelve False.
+        """
+        if self._client is None:
+            raise RuntimeError("LLMClient no inicializado. Llama a startup() primero.")
+
+        try:
+            resp = await self._client.get("/health")
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Health check a llama.cpp falló: %s", exc)
+            return False
