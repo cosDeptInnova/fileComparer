@@ -14,7 +14,11 @@ def build_worker_name() -> str:
     return f"{prefix}-{instance}"
 
 
-if __name__ == "__main__":
+def main() -> None:
     with Connection(redis_connection()):
         worker = Worker([settings.rq_queue_name], name=build_worker_name())
         worker.work()
+
+
+if __name__ == "__main__":
+    main()
