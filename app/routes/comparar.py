@@ -15,7 +15,7 @@ from app.extractors import (
     validate_extraction_request,
 )
 from app.services.jobs import run_compare_job
-from app.services.queue import compare_queue, load_job_result, read_job_state, update_job_state
+from app.services.queue import compare_queue, ensure_queue_backend_ready, load_job_result, read_job_state, update_job_state
 from app.settings import settings
 
 router = APIRouter()
@@ -167,7 +167,19 @@ async def comparar(
     if settings.inline_jobs:
         run_compare_job(sid, str(path_a), str(path_b), **job_kwargs)
     else:
-        compare_queue().enqueue(run_compare_job, sid, str(path_a), str(path_b), job_id=sid, **job_kwargs)
+        try:
+            ensure_queue_backend_ready(require_active_workers=settings.require_active_workers)
+            compare_queue().enqueue(run_compare_job, sid, str(path_a), str(path_b), job_id=sid, **job_kwargs)
+        except RuntimeError as exc:
+            update_job_state(
+                sid,
+                status="error",
+                percent=100,
+                step="cola-no-disponible",
+                detail=str(exc),
+                error=str(exc),
+            )
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "sid": sid,
         "status": "queued",

@@ -90,3 +90,11 @@ curl -X POST http://127.0.0.1:8007/comparar \
   -F 'file_a=@tests/fixtures/base_a.txt' \
   -F 'file_b=@tests/fixtures/base_b.txt'
 ```
+
+
+## Scripts de servicio en Windows
+
+- `scripts/start-service.ps1 -Name comp_docs` arranca la API y su companion `comp_docs_worker`.
+- `scripts/stop-service.ps1 -Name comp_docs` baja la API y también los workers RQ asociados.
+- `scripts/stop-service.ps1 -Name comp_docs_worker` primero baja `comp_docs` y luego los workers, para evitar dejar `/comparar` expuesto sin consumidores.
+- Los scripts cargan `comp_docs.env` desde la raíz del repo si no existe `config\comp_docs.env`.

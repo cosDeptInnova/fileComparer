@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 import os
 import platform
@@ -9,7 +10,14 @@ import sys
 from typing import Any, Sequence
 
 from app.services.queue import redis_connection
-from app.services.rq_compat import get_worker_classes, is_windows, load_rq_runtime, require_supported_windows_rq, rq_version
+from app.services.rq_compat import (
+    get_worker_classes,
+    is_windows,
+    load_rq_runtime,
+    require_supported_windows_rq,
+    reset_rq_runtime_cache,
+    rq_version,
+)
 from app.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -101,13 +109,12 @@ def select_worker_class() -> type[Any]:
     on_windows = is_windows()
     worker_cls, simple_worker_cls, spawn_worker_cls = get_worker_classes()
 
-    if on_windows:
-        require_supported_windows_rq()
-
     if on_windows and requested == "worker":
         raise _legacy_worker_error()
 
     if requested == "spawn":
+        if on_windows:
+            require_supported_windows_rq(spawn_worker_available=spawn_worker_cls is not None)
         if spawn_worker_cls is None:
             raise _missing_spawn_worker_error()
         return spawn_worker_cls
@@ -124,6 +131,7 @@ def select_worker_class() -> type[Any]:
 
     if on_windows:
         if spawn_worker_cls is not None:
+            require_supported_windows_rq(spawn_worker_available=True)
             return spawn_worker_cls
         if windows_worker_mode() == "development" and simple_worker_cls is not None:
             logger.warning(
@@ -131,6 +139,7 @@ def select_worker_class() -> type[Any]:
                 rq_version(),
             )
             return simple_worker_cls
+        require_supported_windows_rq(spawn_worker_available=False)
         raise _missing_spawn_worker_error()
 
     if worker_cls is None:
@@ -196,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=os.getenv("COMPARE_WORKER_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    reset_rq_runtime_cache()
     args = parse_args(argv)
     queue_names = queue_names_from_args(args)
     worker = create_worker(queue_names, worker_name=args.worker_name)

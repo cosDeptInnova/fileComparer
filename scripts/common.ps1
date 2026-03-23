@@ -749,8 +749,12 @@ function New-LauncherScript {
   $svcEnvRel       = Try-GetProp -Obj $Svc -Name "EnvFile" -Default ""
   $svcEnvCandidate = if ($svcEnvRel) { Join-Path $Root $svcEnvRel } else { "" }
   $svcEnvDefault   = Join-Path $Root ("config\{0}.env" -f $svcName)
+  $svcEnvRoot      = Join-Path $Root ("{0}.env" -f $svcName)
+  $svcEnvCompDocs  = if ($svcName -ieq "comp_docs_worker") { Join-Path $Root "comp_docs.env" } else { "" }
   $svcEnv          = if ($svcEnvCandidate -and (Test-Path $svcEnvCandidate)) { $svcEnvCandidate }
                      elseif (Test-Path $svcEnvDefault) { $svcEnvDefault }
+                     elseif (Test-Path $svcEnvRoot) { $svcEnvRoot }
+                     elseif ($svcEnvCompDocs -and (Test-Path $svcEnvCompDocs)) { $svcEnvCompDocs }
                      else { "" }
 
   $python = if ($env:CONDA_PREFIX) { Join-Path $env:CONDA_PREFIX "python.exe" } else { "" }
@@ -1062,15 +1066,35 @@ function Start-ServiceProcess {
 }
 
 function Stop-ServiceProcess {
-  param([Parameter(Mandatory=$true)][hashtable]$Config,[Parameter(Mandatory=$true)]$Svc)
+  param(
+    [Parameter(Mandatory=$true)][hashtable]$Config,
+    [Parameter(Mandatory=$true)]$Svc,
+    [hashtable]$Visited = $null
+  )
 
   $root = Get-RepoRoot
   Ensure-Dirs -Root $root
+
+  if ($null -eq $Visited) { $Visited = @{} }
 
   $name = Try-GetProp -Obj $Svc -Name "Name" -Default ""
   $port = Try-GetInt  -Obj $Svc -Name "Port" -Default 0
   $instanceCount = Get-ServiceInstanceCount -Svc $Svc
   if (-not $name) { return }
+  if ($Visited.ContainsKey($name)) { return }
+  $Visited[$name] = $true
+
+  $stopBefore = @(As-Array (Try-GetProp -Obj $Svc -Name "StopBeforeServices" -Default $null))
+  foreach ($dependentName in $stopBefore) {
+    $targetName = "$dependentName".Trim()
+    if (-not $targetName) { continue }
+    try {
+      $dependentSvc = Resolve-ServiceByName -Config $Config -Name $targetName
+      Stop-ServiceProcess -Config $Config -Svc $dependentSvc -Visited $Visited
+    } catch {
+      Write-Host "[$name] WARNING: no se pudo detener servicio relacionado '$targetName': $($_.Exception.Message)"
+    }
+  }
 
   # 1) Free port (this kills whatever is holding it, including services, with retries)
   if ($port -gt 0) {
@@ -1130,7 +1154,7 @@ function Stop-ServiceProcess {
     if (-not $targetName) { continue }
     try {
       $companionSvc = Resolve-ServiceByName -Config $Config -Name $targetName
-      Stop-ServiceProcess -Config $Config -Svc $companionSvc
+      Stop-ServiceProcess -Config $Config -Svc $companionSvc -Visited $Visited
     } catch {
       Write-Host "[$name] WARNING: no se pudo detener companion service '$targetName': $($_.Exception.Message)"
     }

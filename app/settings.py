@@ -48,6 +48,7 @@ class Settings:
     redis_url: str = _env("REDIS_URL", default="redis://127.0.0.1:6379/0")
     rq_queue_name: str = _env("COMPARE_QUEUE_NAME", default="compare")
     inline_jobs: bool = _env_bool("COMPARE_INLINE_JOBS", default=False)
+    require_active_workers: bool = _env_bool("COMPARE_REQUIRE_ACTIVE_WORKERS", default=False)
     queue_pop_timeout_seconds: int = _env_int("COMPARE_QUEUE_POP_TIMEOUT_SECONDS", default=5)
     worker_heartbeat_interval_seconds: float = _env_float("COMPARE_WORKER_HEARTBEAT_INTERVAL_SECONDS", default=10.0)
     worker_heartbeat_ttl_seconds: int = _env_int("COMPARE_WORKER_HEARTBEAT_TTL_SECONDS", default=45)
