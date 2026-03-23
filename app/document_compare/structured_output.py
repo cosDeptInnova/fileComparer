@@ -120,6 +120,7 @@ def build_compare_messages(
         "sea auténtico.\n\n"
         "Devuelve JSON con claves exactas: review_label, change_type, summary, severity, confidence, text_a, text_b, "
         "display_text_a, display_text_b, display_segments_a, display_segments_b, justification, impact.\n"
+        "Responde SOLO con un único objeto JSON válido y completo, sin markdown ni texto extra.\n"
         "- text_a/text_b: texto limpio comparable, sin ruido visual.\n"
         "- display_*: mismo texto limpio con marcas inline mínimas y estables.\n"
         "- display_segments_*: segmentos compactos usando tipos equal/insert/delete/replace/context.\n"
@@ -155,7 +156,7 @@ def build_global_review_messages(
     )
     serialized_rows = json.dumps(rows, ensure_ascii=False, indent=2)
     user = (
-        "Devuelve JSON con la clave actions.\n"
+        "Devuelve SOLO un objeto JSON válido con la clave actions. No uses markdown ni texto extra.\n"
         "Cada acción debe incluir:\n"
         "- disposition: keep, merge, drop o sin_cambios.\n"
         "- row_ids: ids de fila afectados dentro de esta ventana.\n"
@@ -190,7 +191,7 @@ def build_global_table_review_messages(
     )
     serialized_rows = json.dumps(rows, ensure_ascii=False, indent=2)
     user = (
-        "Devuelve JSON con la clave actions.\n"
+        "Devuelve SOLO un objeto JSON válido con la clave actions. No uses markdown ni texto extra.\n"
         "Cada acción debe incluir:\n"
         "- disposition: keep, merge, drop o sin_cambios.\n"
         "- row_ids: ids de fila afectados.\n"

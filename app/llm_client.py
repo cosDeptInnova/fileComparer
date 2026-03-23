@@ -6,6 +6,7 @@ from collections.abc import Callable
 import os
 import time
 import uuid
+from json import JSONDecodeError
 from typing import Any
 
 import httpx
@@ -83,6 +84,18 @@ class LLMClient:
             )
             raise CompareInferenceAborted(f"compare_inference_aborted:{stage}")
 
+    def _build_json_response_format(self, schema: dict[str, Any] | None) -> dict[str, Any]:
+        if not schema:
+            return {"type": "json_object"}
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "document_compare_response",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
     def chat_completion(
         self,
         *,
@@ -101,10 +114,13 @@ class LLMClient:
             "temperature": temperature,
             "stream": False,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
+            "response_format": self._build_json_response_format(schema),
         }
         if schema:
-            payload["extra_body"] = {"json_schema": schema}
+            payload["extra_body"] = {
+                "json_schema": schema,
+                "guided_json": schema,
+            }
         started = time.perf_counter()
         lease = self.inference_semaphore.acquire(
             timeout_seconds=float(os.getenv("COMPARE_INFERENCE_ACQUIRE_TIMEOUT_SECONDS", "600"))
@@ -138,11 +154,35 @@ class LLMClient:
     ) -> dict[str, Any]:
         started = time.perf_counter()
         outcome = "invalid_json"
+        max_attempts = max(1, int(os.getenv("COMPARE_LLM_JSON_MAX_ATTEMPTS", "3")))
+        prompt_messages = list(messages)
+        last_exc: Exception | None = None
         try:
-            payload = self.chat_completion(messages=messages, schema=schema, temperature=temperature, max_tokens=max_tokens)
-            data = _extract_json_message(payload)
-            outcome = "ok"
-            return data
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    payload = self.chat_completion(
+                        messages=prompt_messages,
+                        schema=schema,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    data = _extract_json_message(payload)
+                    outcome = "ok"
+                    return data
+                except ValueError as exc:
+                    last_exc = exc
+                    if str(exc) != "llm_invalid_json" or attempt >= max_attempts:
+                        outcome = "error"
+                        raise
+                    LOGGER.warning(
+                        "LLM compare request returned invalid JSON on attempt=%s/%s model=%s; retrying with stricter reminder",
+                        attempt,
+                        max_attempts,
+                        self.model_name,
+                    )
+                    prompt_messages = _with_json_retry_reminder(messages)
+            outcome = "error"
+            raise last_exc or ValueError("llm_invalid_json")
         except Exception:
             outcome = "error"
             raise
@@ -151,41 +191,182 @@ class LLMClient:
             observe_inference_concurrency(self.inference_semaphore.active_count())
 
 
+def _with_json_retry_reminder(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reminder = {
+        "role": "system",
+        "content": (
+            "IMPORTANTE: responde exclusivamente con un único objeto JSON válido. "
+            "No uses markdown, fences, comentarios, explicaciones, prefijos ni sufijos. "
+            "Si no estás seguro de un campo, devuélvelo vacío pero mantén JSON válido."
+        ),
+    }
+    return [*messages, reminder]
+
+
 def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("llm_invalid_payload")
+
+    for candidate in _iter_json_candidates(payload):
+        parsed = _parse_json_candidate(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise ValueError("llm_invalid_json")
+
+
+def _iter_json_candidates(payload: dict[str, Any]):
     choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0] or {}
-        message = first.get("message") if isinstance(first, dict) else None
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, dict):
-                if isinstance(content.get("json"), dict):
-                    return content["json"]
-                content = content.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip():
-                        return json.loads(item["text"])
-            if isinstance(content, str) and content.strip():
-                return json.loads(content)
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tool in tool_calls:
-                    fn = tool.get("function") if isinstance(tool, dict) else None
-                    args = fn.get("arguments") if isinstance(fn, dict) else None
-                    if isinstance(args, str) and args.strip():
-                        return json.loads(args)
-        text = first.get("text") if isinstance(first, dict) else None
-        if isinstance(text, str) and text.strip():
-            return json.loads(text)
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                refusal = message.get("refusal")
+                if isinstance(refusal, str) and refusal.strip():
+                    LOGGER.warning("LLM compare request refused structured output: %s", refusal.strip())
+                yield from _iter_message_content_candidates(message)
+            text = choice.get("text")
+            if isinstance(text, (str, dict, list)):
+                yield text
+
     output = payload.get("output")
     if isinstance(output, list):
         for item in output:
-            content = item.get("content") if isinstance(item, dict) else None
-            if isinstance(content, list):
-                for subitem in content:
-                    if isinstance(subitem, dict) and isinstance(subitem.get("text"), str) and subitem.get("text").strip():
-                        return json.loads(subitem["text"])
-    raise ValueError("llm_invalid_json")
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, (str, dict, list)):
+                yield content
+
+    for key in ("content", "text", "response", "generated_text"):
+        value = payload.get(key)
+        if isinstance(value, (str, dict, list)):
+            yield value
+
+
+def _iter_message_content_candidates(message: dict[str, Any]):
+    content = message.get("content")
+    if isinstance(content, dict):
+        json_content = content.get("json")
+        if isinstance(json_content, dict):
+            yield json_content
+        for key in ("content", "text"):
+            nested = content.get(key)
+            if isinstance(nested, (str, dict, list)):
+                yield nested
+    elif isinstance(content, (str, list)):
+        yield content
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool in tool_calls:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, (str, dict, list)):
+                yield args
+
+
+
+def _parse_json_candidate(candidate: Any) -> dict[str, Any] | None:
+    if isinstance(candidate, dict):
+        return candidate
+    if isinstance(candidate, list):
+        for item in candidate:
+            if isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"json", "output_json"} and isinstance(item.get("json"), dict):
+                    return item["json"]
+                for key in ("json", "text", "content", "arguments"):
+                    nested = item.get(key)
+                    parsed = _parse_json_candidate(nested)
+                    if isinstance(parsed, dict):
+                        return parsed
+            elif isinstance(item, str):
+                parsed = _loads_maybe_embedded_json(item)
+                if isinstance(parsed, dict):
+                    return parsed
+        return None
+    if isinstance(candidate, str):
+        return _loads_maybe_embedded_json(candidate)
+    return None
+
+
+
+def _loads_maybe_embedded_json(raw: str) -> dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    direct = _try_json_loads(text)
+    if isinstance(direct, dict):
+        return direct
+
+    fenced = text
+    if fenced.startswith("```"):
+        fenced = _strip_markdown_code_fence(fenced)
+        direct = _try_json_loads(fenced)
+        if isinstance(direct, dict):
+            return direct
+
+    embedded = _extract_first_json_object(text)
+    if embedded:
+        parsed = _try_json_loads(embedded)
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+
+def _try_json_loads(raw: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw)
+    except JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        start = text.find("{", start + 1)
+    return None
