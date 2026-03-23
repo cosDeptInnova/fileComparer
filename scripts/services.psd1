@@ -31,7 +31,7 @@
         COMPARE_REQUIRE_ACTIVE_WORKERS="true"
       };
       CompanionFailureIsFatal=$true;
-      EnvFile="config\comp_docs.env";
+      EnvFile="comp_docs.env";
       Port=8007
     },
     @{
@@ -52,7 +52,8 @@
       StartupProbeDelayMs=1500;
       ReadyTimeoutSec=45;
       ReadyLogPattern=@("Inicializando worker RQ:","*** Listening on compare...");
-      EnvFile="config\comp_docs.env";
+      StopBeforeServices=@("comp_docs");
+      EnvFile="comp_docs.env";
       Port=0
     },
     @{

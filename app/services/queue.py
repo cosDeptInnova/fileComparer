@@ -6,8 +6,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from typing import TYPE_CHECKING
-
 try:
     from redis import Redis
 except Exception as exc:  # pragma: no cover - allows import without redis in lightweight environments
@@ -26,42 +24,102 @@ def _decode_if_bytes(value: Any) -> str:
     return str(value)
 
 
-
 def redis_connection() -> Redis:
     if Redis is None:
         raise RuntimeError(
             "La dependencia 'redis' no está instalada. Instala redis-py en el entorno antes de arrancar comp_docs. "
             f"Error original: {_REDIS_IMPORT_ERROR}"
         )
-    # RQ almacena payloads binarios (pickles/zlib) y necesita recibir bytes desde Redis.
-    # Si decode_responses=True, redis-py convierte respuestas a str y RQ termina intentando
-    # hacer .decode() sobre ellas o decodificando binario arbitrario como UTF-8.
     return Redis.from_url(settings.redis_url, decode_responses=False)
 
+
+def _require_queue_connection(connection: Redis | None = None) -> Redis:
+    conn = connection or redis_connection()
+    if hasattr(conn, "ping"):
+        try:
+            conn.ping()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "No se pudo conectar a Redis para la cola de comparación. "
+                f"Verifica REDIS_URL={settings.redis_url!r}. Error: {exc}"
+            ) from exc
+    return conn
+
+
+def _worker_queue_names(worker: Any) -> set[str]:
+    if hasattr(worker, "queue_names"):
+        try:
+            names = worker.queue_names()
+            return {str(name) for name in names}
+        except Exception:  # noqa: BLE001
+            pass
+
+    queues = getattr(worker, "queues", None) or []
+    names: set[str] = set()
+    for queue in queues:
+        queue_name = getattr(queue, "name", None)
+        if queue_name:
+            names.add(str(queue_name))
+    return names
+
+
+def count_queue_workers(queue_name: str, *, connection: Redis | None = None) -> int:
+    conn = _require_queue_connection(connection)
+    worker_cls = load_rq_runtime()["Worker"]
+    if worker_cls is None or not hasattr(worker_cls, "all"):
+        return 0
+
+    try:
+        workers = worker_cls.all(connection=conn)
+    except TypeError:
+        workers = worker_cls.all(conn)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"No se pudo consultar los workers RQ activos: {exc}") from exc
+
+    active = 0
+    for worker in workers or []:
+        if queue_name in _worker_queue_names(worker):
+            active += 1
+    return active
+
+
+def ensure_queue_backend_ready(*, require_active_workers: bool | None = None, connection: Redis | None = None) -> Redis:
+    conn = _require_queue_connection(connection)
+    must_have_workers = settings.require_active_workers if require_active_workers is None else require_active_workers
+    if must_have_workers:
+        worker_count = count_queue_workers(settings.rq_queue_name, connection=conn)
+        if worker_count < 1:
+            raise RuntimeError(
+                "No hay workers RQ activos escuchando la cola de comparación. "
+                "Arranca comp_docs_worker antes de invocar /comparar. "
+                f"Queue={settings.rq_queue_name!r} Redis={settings.redis_url!r}."
+            )
+    return conn
 
 
 def compare_queue():
     queue_class = load_rq_runtime()["Queue"]
+    connection = ensure_queue_backend_ready(require_active_workers=False)
     return queue_class(
         settings.rq_queue_name,
-        connection=redis_connection(),
+        connection=connection,
         default_timeout=int(settings.llm_timeout_seconds * 4),
     )
-
 
 
 def job_key(sid: str) -> str:
     return f"compare:job:{sid}"
 
 
-
 def _ensure_hash_key(connection: Redis, key: str) -> None:
+    if not hasattr(connection, "type"):
+        return
     raw_type = connection.type(key)
     key_type = _decode_if_bytes(raw_type).strip().lower() if raw_type is not None else "none"
     if key_type in {"none", "hash"}:
         return
-    connection.delete(key)
-
+    if hasattr(connection, "delete"):
+        connection.delete(key)
 
 
 def update_job_state(job_id: str, **fields: object) -> None:
@@ -76,7 +134,6 @@ def update_job_state(job_id: str, **fields: object) -> None:
     if payload:
         connection.hset(key, mapping=payload)
     connection.expire(key, 60 * 60 * 24)
-
 
 
 def read_job_state(sid: str) -> dict[str, object]:
@@ -95,7 +152,6 @@ def read_job_state(sid: str) -> dict[str, object]:
     return parsed
 
 
-
 def persist_job_result(sid: str, payload: dict[str, object]) -> Path:
     target_dir = settings.data_dir / sid
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -108,7 +164,6 @@ def persist_job_result(sid: str, payload: dict[str, object]) -> Path:
         os.fsync(handle.fileno())
     os.replace(temp_path, output_path)
     return output_path
-
 
 
 def load_job_result(sid: str) -> dict[str, object] | None:
