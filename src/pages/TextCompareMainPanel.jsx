@@ -18,6 +18,10 @@ import {
   TEXT_COMPARE_FILTER_ALL,
   TEXT_COMPARE_SORT_DEFAULT,
 } from "../lib/textCompareViewModel.mjs";
+import {
+  isTextCompareErrorStatus,
+  isTextCompareSuccessStatus,
+} from "../lib/textCompareJobState.mjs";
 
 const POLL_MS = 1200;
 const RENDER_CHUNK_SIZE = 30;
@@ -843,10 +847,10 @@ export default function TextCompareMainPanel({ isDarkMode }) {
             return;
           const pr = await pollTextCompareProgress(newSid);
           setProgress(pr);
-          if (pr.status === "done") {
+          if (isTextCompareSuccessStatus(pr?.status)) {
             stopPolling();
             setIsSubmitting(false);
-          } else if (pr.status === "error") {
+          } else if (isTextCompareErrorStatus(pr?.status)) {
             stopPolling();
             setIsSubmitting(false);
             setError(
@@ -867,7 +871,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
   };
 
   useEffect(() => {
-    if (!sid || progress.status !== "done") return;
+    if (!sid || !isTextCompareSuccessStatus(progress?.status)) return;
     if (
       fetchedResultRef.current.sid === sid &&
       fetchedResultRef.current.completed
@@ -956,10 +960,12 @@ export default function TextCompareMainPanel({ isDarkMode }) {
     0,
     filteredRows.length - visibleRows.length,
   );
+  const isTerminalSuccess = isTextCompareSuccessStatus(progress?.status);
+  const isTerminalError = isTextCompareErrorStatus(progress?.status);
   const progressMetrics = progress?.metrics || {};
   const hasResult = Boolean(result);
-  const showComparisonSetup = !hasResult;
-  const showProgressPanel = sid && !hasResult;
+  const showComparisonSetup = !hasResult && (!sid || isTerminalError);
+  const showProgressPanel = sid && !hasResult && !isTerminalSuccess;
   const cacheMeta = result?.meta?.cache || {};
   const auditMeta = result?.meta?.audit || {};
   const diagnosticsMeta = result?.meta?.diagnostics || {};
@@ -1286,7 +1292,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
                 Progreso: {progress.percent ?? 0}%
               </div>
               <div
-                className={`text-xs 2xl:text-sm ${progress.status === "error" ? (isDarkMode ? "text-red-300" : "text-red-600") : isDarkMode ? "text-gray-300" : "text-gray-600"}`}
+                className={`text-xs 2xl:text-sm ${isTerminalError ? (isDarkMode ? "text-red-300" : "text-red-600") : isDarkMode ? "text-gray-300" : "text-gray-600"}`}
               >
                 {progress.step}
                 {progress.detail ? ` — ${progress.detail}` : ""}
@@ -1296,13 +1302,13 @@ export default function TextCompareMainPanel({ isDarkMode }) {
               className={`w-full mt-1 h-3 2xl:h-4 rounded-full overflow-hidden ${isDarkMode ? "bg-gray-700" : "bg-gray-200"}`}
             >
               <div
-                className={`h-full transition-all duration-300 ease-out ${progress.status === "error" ? "bg-red-500" : isDarkMode ? "bg-blue-400" : "bg-blue-600"}`}
+                className={`h-full transition-all duration-300 ease-out ${isTerminalError ? "bg-red-500" : isDarkMode ? "bg-blue-400" : "bg-blue-600"}`}
                 style={{
                   width: `${Math.min(100, Math.max(0, progress.percent || 0))}%`,
                 }}
               />
             </div>
-            {progress.status === "error" && (
+            {isTerminalError && (
               <div
                 className={`mt-3 text-sm 2xl:text-base ${isDarkMode ? "text-red-300" : "text-red-700"}`}
               >
