@@ -226,7 +226,12 @@ def extract_document_result(path: str, *, soffice_path: str | None = None, drop_
     elif ext in LEGACY_OFFICE_EXTENSIONS:
         if not resolved_soffice:
             raise MissingDependencyError(f"Se requiere LibreOffice/soffice para extraer {ext}")
-        converted, temp_dir = _convert_legacy(source, resolved_soffice)
+        conversion_result = _convert_legacy(source, resolved_soffice)
+        cleanup_dir: Path | None = None
+        if isinstance(conversion_result, tuple):
+            converted, cleanup_dir = conversion_result
+        else:
+            converted = conversion_result
         try:
             nested = extract_document_result(
                 str(converted),
@@ -236,7 +241,8 @@ def extract_document_result(path: str, *, soffice_path: str | None = None, drop_
             )
         finally:
             try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+                if cleanup_dir is not None and cleanup_dir.exists():
+                    shutil.rmtree(cleanup_dir, ignore_errors=True)
             except Exception:
                 pass
         metadata = {

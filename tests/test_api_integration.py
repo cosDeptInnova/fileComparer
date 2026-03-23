@@ -236,7 +236,7 @@ def test_requested_engine_changes_extraction_result(monkeypatch, client: TestCli
     docling_sid = docling_response.json()["sid"]
     docling_result = client.get(f"/resultado/{docling_sid}/json").json()
 
-    assert builtin_result["meta"]["documents"]["a"]["raw_text"] == "builtin:a"
-    assert docling_result["meta"]["documents"]["a"]["raw_text"] == "docling:a"
+    assert builtin_result["meta"]["documents"]["a"]["raw_text"] == "builtin:A_a"
+    assert docling_result["meta"]["documents"]["a"]["raw_text"] == "docling:A_a"
     assert builtin_result["meta"]["documents"]["a"]["metadata"]["engine_used"] == "builtin"
     assert docling_result["meta"]["documents"]["a"]["metadata"]["engine_used"] == "docling"
