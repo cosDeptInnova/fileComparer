@@ -25,15 +25,16 @@ def job_key(sid: str) -> str:
     return f"compare:job:{sid}"
 
 
-def update_job_state(sid: str, **fields: object) -> None:
+def update_job_state(job_id: str, **fields: object) -> None:
+    normalized_fields = {"sid": job_id, **fields}
     payload = {
         key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        for key, value in fields.items()
+        for key, value in normalized_fields.items()
     }
     connection = redis_connection()
     if payload:
-        connection.hset(job_key(sid), mapping=payload)
-    connection.expire(job_key(sid), 60 * 60 * 24)
+        connection.hset(job_key(job_id), mapping=payload)
+    connection.expire(job_key(job_id), 60 * 60 * 24)
 
 
 def read_job_state(sid: str) -> dict[str, object]:

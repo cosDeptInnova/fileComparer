@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 def run_compare_job(sid: str, path_a: str, path_b: str) -> dict[str, object]:
     update_job_state(
         sid,
-        sid=sid,
         status="running",
         percent=20,
         step="extrayendo",
@@ -24,7 +23,6 @@ def run_compare_job(sid: str, path_a: str, path_b: str) -> dict[str, object]:
         persist_job_result(sid, payload)
         update_job_state(
             sid,
-            sid=sid,
             status="done",
             percent=100,
             step="completado",
@@ -35,7 +33,6 @@ def run_compare_job(sid: str, path_a: str, path_b: str) -> dict[str, object]:
         logger.exception("Job %s falló", sid)
         update_job_state(
             sid,
-            sid=sid,
             status="error",
             percent=100,
             step="error",

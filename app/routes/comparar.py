@@ -95,7 +95,7 @@ async def comparar(
     path_b = target_dir / name_b
     path_a.write_bytes(content_a)
     path_b.write_bytes(content_b)
-    update_job_state(sid, sid=sid, status="queued", percent=5, step="encolado", detail="Esperando worker")
+    update_job_state(sid, status="queued", percent=5, step="encolado", detail="Esperando worker")
 
     if settings.inline_jobs:
         run_compare_job(sid, str(path_a), str(path_b))
