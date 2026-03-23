@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass
 
 SENTENCE_RE = re.compile(r"(?<=[.!?;:])\s+(?=[A-ZÁÉÍÓÚÑ0-9])")
+NUMBERING_ONLY_SEGMENT_RE = re.compile(
+    r"(?i)^(?:[ivxlcdm]+[\)\.]|\(?\d+(?:\.\d+)*[\)\.]|[a-z]\))$"
+)
+SHORT_SEGMENT_JOIN_THRESHOLD = 10
 
 
 @dataclass(slots=True)
@@ -18,16 +22,57 @@ def sentence_segments(text: str) -> list[str]:
     cleaned = (text or "").strip()
     if not cleaned:
         return []
+    paragraph_chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", cleaned) if chunk.strip()]
+    if len(paragraph_chunks) > 1:
+        return _merge_short_prefix_segments(paragraph_chunks)
+
     pieces = [piece.strip() for piece in SENTENCE_RE.split(cleaned) if piece.strip()]
     if len(pieces) == 1:
-        return [segment.strip() for segment in re.split(r"\n+", cleaned) if segment.strip()]
-    return pieces
+        return _merge_short_prefix_segments([segment.strip() for segment in re.split(r"\n+", cleaned) if segment.strip()])
+    return _merge_short_prefix_segments(pieces)
+
+
+def _merge_short_prefix_segments(segments: list[str]) -> list[str]:
+    merged: list[str] = []
+    pending_prefix = ""
+    for segment in segments:
+        current = segment.strip()
+        if not current:
+            continue
+        if NUMBERING_ONLY_SEGMENT_RE.fullmatch(current):
+            continue
+        if pending_prefix:
+            current = f"{pending_prefix} {current}".strip()
+            pending_prefix = ""
+        normalized = current.rstrip()
+        if len(normalized) <= SHORT_SEGMENT_JOIN_THRESHOLD:
+            pending_prefix = normalized
+            continue
+        merged.append(normalized)
+    if pending_prefix:
+        if merged:
+            merged[-1] = f"{merged[-1]} {pending_prefix}".strip()
+        else:
+            merged.append(pending_prefix)
+    return merged
 
 
 def build_blocks(text: str, target_chars: int, overlap_chars: int) -> list[TextBlock]:
     sentences = sentence_segments(text)
     if not sentences:
         return []
+
+    if re.search(r"\n{2,}", text or ""):
+        blocks: list[TextBlock] = []
+        cursor = 0
+        for idx, sentence in enumerate(sentences):
+            start = text.find(sentence, cursor)
+            if start < 0:
+                start = cursor
+            end = start + len(sentence)
+            blocks.append(TextBlock(index=idx, text=sentence, start_char=start, end_char=end))
+            cursor = end
+        return blocks
 
     blocks: list[TextBlock] = []
     sentence_positions: list[tuple[str, int, int]] = []

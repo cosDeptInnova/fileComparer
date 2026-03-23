@@ -185,6 +185,7 @@ def test_compare_documents_reports_pairing_counters_and_row_pair_types(monkeypat
     monkeypatch.setattr(comparison_pipeline, "extract_document_result", fake_extract_document_result)
     monkeypatch.setattr(comparison_pipeline, "normalize_text", lambda text: text)
     monkeypatch.setattr(comparison_pipeline, "build_blocks", lambda text, *_args: [make_block(i, part) for i, part in enumerate(text.splitlines()) if part])
+    monkeypatch.setattr(comparison_pipeline, "_persist_runtime_snapshot", lambda **_kwargs: None)
 
     result = comparison_pipeline.compare_documents(file_a, file_b, sid="sid-test", llm_client=PairingStubLLMClient())
 
@@ -227,6 +228,7 @@ def test_compare_documents_keeps_partial_result_when_pair_fails(monkeypatch, tmp
     monkeypatch.setattr(comparison_pipeline, "normalize_text", lambda text: text)
     monkeypatch.setattr(comparison_pipeline, "build_blocks", lambda text, *_args: [make_block(i, part) for i, part in enumerate(text.splitlines()) if part])
     monkeypatch.setattr(comparison_pipeline.settings, "compare_failed_blocks_error_ratio", 0.8)
+    monkeypatch.setattr(comparison_pipeline, "_persist_runtime_snapshot", lambda **_kwargs: None)
 
     result = comparison_pipeline.compare_documents(file_a, file_b, sid="sid-partial", llm_client=FailingPairStubLLMClient())
 
@@ -269,6 +271,9 @@ def test_compare_documents_keeps_original_rows_when_reconciliation_fails(monkeyp
     monkeypatch.setattr(comparison_pipeline, "extract_document_result", fake_extract_document_result)
     monkeypatch.setattr(comparison_pipeline, "normalize_text", lambda text: text)
     monkeypatch.setattr(comparison_pipeline, "build_blocks", lambda text, *_args: [make_block(i, part) for i, part in enumerate(text.splitlines()) if part])
+    monkeypatch.setattr(comparison_pipeline, "_persist_runtime_snapshot", lambda **_kwargs: None)
+    monkeypatch.setattr(comparison_pipeline.settings, "compare_reconcile_with_llm", True)
+    monkeypatch.setattr(comparison_pipeline.settings, "compare_reconcile_min_rows", 2)
 
     result = comparison_pipeline.compare_documents(
         file_a,
@@ -315,6 +320,7 @@ def test_compare_documents_uses_local_fallback_when_llm_returns_empty_payload(mo
     monkeypatch.setattr(comparison_pipeline, "extract_document_result", fake_extract_document_result)
     monkeypatch.setattr(comparison_pipeline, "normalize_text", lambda text: text)
     monkeypatch.setattr(comparison_pipeline, "build_blocks", lambda text, *_args: [make_block(i, part) for i, part in enumerate(text.splitlines()) if part])
+    monkeypatch.setattr(comparison_pipeline, "_persist_runtime_snapshot", lambda **_kwargs: None)
 
     result = comparison_pipeline.compare_documents(
         file_a,
@@ -335,3 +341,63 @@ def test_compare_documents_uses_local_fallback_when_llm_returns_empty_payload(mo
             "message": "Payload del LLM vacío.",
         }
     ]
+
+
+def test_compare_documents_avoids_false_differences_for_equivalent_docx_and_pdf_text(monkeypatch, tmp_path: Path):
+    file_a = tmp_path / "contrato.docx"
+    file_b = tmp_path / "contrato.pdf"
+    file_a.write_text("placeholder", encoding="utf-8")
+    file_b.write_text("placeholder", encoding="utf-8")
+
+    texts = {
+        str(file_a): (
+            "PRIMERA.- OBJETO DEL CONTRATO\n"
+            "El PROVEEDOR diseñará y desarrollará un sitio web corporativo.\n\n"
+            "SEGUNDA.- PROYECTO\n"
+            "Auditoría SEO\n\n"
+            "Investigación del mercado en entornos digitales\n\n"
+            "Diseño y desarrollo web"
+        ),
+        str(file_b): (
+            "I.\n"
+            "PRIMERA.- OBJETO DEL CONTRATO\n"
+            "El PROVEEDOR diseñará y desarrollará un sitio web corporativo.\n\n"
+            "II.\n"
+            "SEGUNDA.- PROYECTO\n"
+            "1.\n"
+            "Auditoría SEO\n\n"
+            "2.\n"
+            "Investigación del mercado en entornos digitales\n\n"
+            "3.\n"
+            "Diseño y desarrollo web"
+        ),
+    }
+
+    def fake_extract_document_result(path: str, *, soffice_path=None, drop_headers=True, engine="auto"):
+        return ExtractionResult(
+            text=texts[str(path)],
+            engine="builtin",
+            quality_score=0.95,
+            metadata={
+                "source_format": Path(path).suffix.lstrip("."),
+                "source_format_real": Path(path).suffix.lstrip("."),
+                "conversion": {"applied": False},
+                "engine_used": "builtin",
+            },
+            blocks=[],
+            quality_signals={"block_count": 0},
+        )
+
+    monkeypatch.setattr(comparison_pipeline, "extract_document_result", fake_extract_document_result)
+    monkeypatch.setattr(comparison_pipeline, "_persist_runtime_snapshot", lambda **_kwargs: None)
+
+    result = comparison_pipeline.compare_documents(
+        file_a,
+        file_b,
+        sid="sid-equivalente",
+        llm_client=PairingStubLLMClient(),
+    )
+
+    assert result.status == "done"
+    assert result.rows == []
+    assert result.meta["pairing"]["pair_count"] == 4
