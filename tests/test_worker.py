@@ -3,6 +3,11 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 class DummyRedis:
@@ -13,42 +18,45 @@ class DummyRedis:
 
 class DummyQueue:
     def __init__(self, *args, **kwargs):
-        pass
-
-
-class DummyConnection:
-    def __init__(self, *_args, **_kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+        self.args = args
+        self.kwargs = kwargs
 
 
 class DummyWorker:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.work_calls = []
+
+    def work(self, *args, **kwargs):
+        self.work_calls.append({"args": args, "kwargs": kwargs})
+        return True
 
 
 class DummySimpleWorker(DummyWorker):
     pass
 
 
-def _load_worker_module(monkeypatch):
+class DummySpawnWorker(DummyWorker):
+    pass
+
+
+def _load_worker_module(monkeypatch, *, include_spawn=True):
     redis_mod = types.ModuleType("redis")
     rq_mod = types.ModuleType("rq")
+    rq_worker_mod = types.ModuleType("rq.worker")
 
     redis_mod.Redis = DummyRedis
     rq_mod.Queue = DummyQueue
-    rq_mod.Connection = DummyConnection
     rq_mod.Worker = DummyWorker
     rq_mod.SimpleWorker = DummySimpleWorker
+    rq_worker_mod.Worker = DummyWorker
+    if include_spawn:
+        rq_worker_mod.SpawnWorker = DummySpawnWorker
 
     monkeypatch.setitem(sys.modules, "redis", redis_mod)
     monkeypatch.setitem(sys.modules, "rq", rq_mod)
+    monkeypatch.setitem(sys.modules, "rq.worker", rq_worker_mod)
     sys.modules.pop("app.services.queue", None)
     sys.modules.pop("app.worker", None)
     return importlib.import_module("app.worker")
@@ -74,17 +82,70 @@ def test_build_worker_name_honors_explicit_override(monkeypatch):
     assert worker_module.build_worker_name() == "comp_docs_worker-prod-a"
 
 
-def test_worker_class_uses_simple_worker_when_fork_is_unavailable(monkeypatch):
-    monkeypatch.delenv("COMPARE_USE_SIMPLE_WORKER", raising=False)
-    worker_module = _load_worker_module(monkeypatch)
-    monkeypatch.delattr(worker_module.os, "fork", raising=False)
+def test_windows_selects_spawn_worker_instead_of_default_worker(monkeypatch):
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    worker_module = _load_worker_module(monkeypatch, include_spawn=True)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
 
-    assert worker_module.worker_class() is worker_module.SimpleWorker
+    assert worker_module.select_worker_class() is DummySpawnWorker
+    assert worker_module.select_worker_class() is not DummyWorker
 
 
-def test_worker_class_respects_force_disable_simple_worker(monkeypatch):
-    monkeypatch.setenv("COMPARE_USE_SIMPLE_WORKER", "false")
-    worker_module = _load_worker_module(monkeypatch)
-    monkeypatch.delattr(worker_module.os, "fork", raising=False)
+def test_non_windows_keeps_default_worker(monkeypatch):
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    worker_module = _load_worker_module(monkeypatch, include_spawn=True)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Linux")
 
-    assert worker_module.worker_class() is worker_module.Worker
+    assert worker_module.select_worker_class() is DummyWorker
+
+
+def test_windows_forced_default_worker_aborts_with_explicit_error(monkeypatch):
+    monkeypatch.setenv("COMPARE_WORKER_CLASS", "worker")
+    worker_module = _load_worker_module(monkeypatch, include_spawn=True)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
+
+    try:
+        worker_module.select_worker_class()
+    except RuntimeError as exc:
+        assert "rq worker" in str(exc)
+        assert "Windows" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected RuntimeError")
+
+
+def test_windows_without_spawn_requires_rq_22_or_development_fallback(monkeypatch):
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    monkeypatch.setenv("COMPARE_WINDOWS_WORKER_MODE", "production")
+    worker_module = _load_worker_module(monkeypatch, include_spawn=False)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(worker_module, "rq_version", lambda: "1.16.2")
+
+    try:
+        worker_module.select_worker_class()
+    except RuntimeError as exc:
+        assert "RQ >= 2.2" in str(exc)
+        assert "1.16.2" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected RuntimeError")
+
+
+def test_windows_development_fallback_uses_simple_worker_only_when_spawn_missing(monkeypatch):
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    monkeypatch.setenv("COMPARE_WINDOWS_WORKER_MODE", "development")
+    worker_module = _load_worker_module(monkeypatch, include_spawn=False)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
+
+    assert worker_module.select_worker_class() is DummySimpleWorker
+
+
+def test_create_worker_builds_queues_and_name(monkeypatch):
+    monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
+    worker_module = _load_worker_module(monkeypatch, include_spawn=True)
+    monkeypatch.setattr(worker_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(worker_module, "build_worker_name", lambda: "worker-name")
+
+    worker = worker_module.create_worker(["compare", "priority"], connection=object())
+
+    assert isinstance(worker, DummyWorker)
+    assert worker.kwargs["name"] == "worker-name"
+    assert len(worker.args[0]) == 2

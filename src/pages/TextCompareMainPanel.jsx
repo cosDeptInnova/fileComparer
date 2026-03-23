@@ -531,7 +531,7 @@ function buildCompareTroubleshooting(errorMessage) {
         "Consulta `/api/comparador/workers/health` para verificar Redis, TTL, workers activos y workers expirados.",
         "Si el worker se cierra al arrancar, revisa su traceback para detectar dependencias rotas.",
       ],
-      commands: ["cd comp_docs && python -m app.worker"],
+      commands: ["cd comp_docs && python -m app.worker --queue compare", "cd comp_docs/scripts && ./start_worker.ps1"],
     };
   }
 
@@ -554,7 +554,7 @@ function buildCompareTroubleshooting(errorMessage) {
       commands: [
         "pip uninstall -y fitz",
         "pip install --upgrade pymupdf",
-        "cd comp_docs && python -m app.worker",
+        "cd comp_docs && python -m app.worker --queue compare",
       ],
     };
   }
@@ -577,7 +577,7 @@ function buildCompareTroubleshooting(errorMessage) {
         "Si cambiaste de proveedor o modelo, reinicia comp_docs y su worker dedicado para limpiar estado y caché.",
       ],
       commands: [
-        "cd comp_docs && python -m app.worker",
+        "cd comp_docs && python -m app.worker --queue compare",
         "cd scripts && ./stop-service.ps1 -Name comp_docs_worker && ./start-service.ps1 -Name comp_docs_worker",
       ],
     };

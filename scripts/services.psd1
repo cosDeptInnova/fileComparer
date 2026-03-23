@@ -44,6 +44,7 @@
         COMPARE_WORKER_CONCURRENCY="1";
         COMPARE_QUEUE_NAME="compare";
         MAX_CONCURRENT_JOBS="4"
+        COMPARE_WINDOWS_WORKER_MODE="production"
       };
       EnvFile="config\comp_docs.env";
       Port=0
