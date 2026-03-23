@@ -16,6 +16,7 @@ _RQ_RUNTIME_CACHE: dict[str, Any] | None = None
 _RQ_RUNTIME_CACHE_SIGNATURE: tuple[int | None, int | None] | None = None
 _PATCHED_WINDOWS_MP = False
 _PATCHED_WINDOWS_SPAWN_WORKER = False
+_WINDOWS_RQ_PATCH_THRESHOLD = (2, 3, 1)
 
 
 def is_windows() -> bool:
@@ -37,17 +38,27 @@ def _parse_version(raw: str) -> tuple[int, ...]:
 
 
 
+def windows_needs_compat_patches() -> bool:
+    if not is_windows():
+        return False
+    version = _parse_version(rq_version())
+    if version == (0,):
+        return True
+    return version < _WINDOWS_RQ_PATCH_THRESHOLD
+
+
+
 def _patch_windows_multiprocessing() -> None:
     global _PATCHED_WINDOWS_MP
-    if _PATCHED_WINDOWS_MP or not is_windows():
+    if _PATCHED_WINDOWS_MP or not windows_needs_compat_patches():
         return
 
     original_get_context = multiprocessing.get_context
 
     def _safe_get_context(method: str | None = None):
         if method == "fork":
-            logger.warning(
-                "RQ solicitó el contexto 'fork' en Windows; se redirige a 'spawn' para compatibilidad."
+            logger.debug(
+                "RQ solicitó el contexto 'fork' en Windows; se redirige a 'spawn' como compatibilidad legacy."
             )
             method = "spawn"
         return original_get_context(method)
@@ -67,7 +78,7 @@ def _patch_windows_spawn_worker(spawn_worker_cls: type[Any] | None) -> type[Any]
     global _PATCHED_WINDOWS_SPAWN_WORKER
     if (
         _PATCHED_WINDOWS_SPAWN_WORKER
-        or not is_windows()
+        or not windows_needs_compat_patches()
         or spawn_worker_cls is None
         or hasattr(os, "wait4")
     ):
@@ -89,8 +100,8 @@ def _patch_windows_spawn_worker(spawn_worker_cls: type[Any] | None) -> type[Any]
 
     setattr(spawn_worker_cls, "wait_for_horse", _wait_for_horse)
     _PATCHED_WINDOWS_SPAWN_WORKER = True
-    logger.warning(
-        "RQ SpawnWorker usa os.wait4, que no existe en Windows; se redirige a os.waitpid para compatibilidad."
+    logger.debug(
+        "RQ SpawnWorker usa os.wait4 en esta versión; se redirige a os.waitpid como compatibilidad legacy de Windows."
     )
     return spawn_worker_cls
 
@@ -131,7 +142,7 @@ def load_rq_runtime() -> dict[str, Any]:
     if _RQ_RUNTIME_CACHE is not None and _RQ_RUNTIME_CACHE_SIGNATURE == signature:
         return _RQ_RUNTIME_CACHE
 
-    if is_windows():
+    if windows_needs_compat_patches():
         _patch_windows_multiprocessing()
 
     try:
@@ -148,7 +159,9 @@ def load_rq_runtime() -> dict[str, Any]:
         "Queue": getattr(rq_module, "Queue", None),
         "SimpleWorker": getattr(rq_module, "SimpleWorker", None),
         "Worker": getattr(rq_module, "Worker", None),
-        "SpawnWorker": _patch_windows_spawn_worker(getattr(worker_module, "SpawnWorker", None) if worker_module is not None else None),
+        "SpawnWorker": _patch_windows_spawn_worker(
+            getattr(worker_module, "SpawnWorker", None) if worker_module is not None else None
+        ),
     }
 
     if runtime["Queue"] is None:
@@ -191,9 +204,8 @@ def require_supported_windows_rq(*, spawn_worker_available: bool | None = None) 
             "Este proyecto necesita RQ >= 2.2.0 en Windows para poder usar SpawnWorker. "
             f"Versión detectada: {rq_version()}."
         )
-    if version < (2, 3, 1):
+    if version < _WINDOWS_RQ_PATCH_THRESHOLD:
         logger.warning(
-            "Se detectó RQ %s en Windows. Para un despliegue estable se recomienda al menos RQ 2.3.1, "
-            "que corrige fallos de compatibilidad en Windows.",
+            "Se detectó RQ %s en Windows. Funciona con compatibilidad legacy, pero para un despliegue estable se recomienda al menos RQ 2.3.1.",
             rq_version(),
         )

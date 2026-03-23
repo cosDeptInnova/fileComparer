@@ -135,7 +135,7 @@ def test_windows_import_failure_returns_controlled_runtime_error(monkeypatch):
     worker_module = _load_worker_module(monkeypatch, include_spawn=True)
     monkeypatch.setattr(worker_module.platform, "system", lambda: "Windows")
     monkeypatch.delenv("COMPARE_WORKER_CLASS", raising=False)
-    worker_module._RQ_RUNTIME_CACHE = None
+    worker_module.reset_rq_runtime_cache()
 
     real_import_module = importlib.import_module
 
