@@ -386,6 +386,29 @@ function Test-ProcessAlive {
   try { Get-Process -Id $ProcessId -ErrorAction Stop | Out-Null; return $true } catch { return $false }
 }
 
+function Wait-ProcessExit {
+  param(
+    [Parameter(Mandatory=$true)][int]$ProcessId,
+    [int]$TimeoutSeconds = 8,
+    [int]$PollMilliseconds = 250
+  )
+
+  if ($ProcessId -le 0) { return $true }
+  if (-not (Test-ProcessAlive -ProcessId $ProcessId)) { return $true }
+
+  $timeoutMs = [Math]::Max(0, ($TimeoutSeconds * 1000))
+  $pollMs = [Math]::Max(50, $PollMilliseconds)
+  $waitedMs = 0
+
+  while ($waitedMs -lt $timeoutMs) {
+    if (-not (Test-ProcessAlive -ProcessId $ProcessId)) { return $true }
+    Start-Sleep -Milliseconds $pollMs
+    $waitedMs += $pollMs
+  }
+
+  return (-not (Test-ProcessAlive -ProcessId $ProcessId))
+}
+
 function Stop-WindowsServiceRobust {
   param([Parameter(Mandatory=$true)][string]$ServiceName)
 
@@ -407,26 +430,33 @@ function Stop-ProcessTreeRobust {
 
   if (-not (Test-ProcessAlive -ProcessId $ProcessId)) { return }
 
-  # Try soft tree kill via CIM first
-  try {
-    $children = @(
-      Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ParentProcessId -eq $ProcessId } |
-        Select-Object -ExpandProperty ProcessId
-    )
-    foreach ($childId in (As-Array $children)) {
-      if ($childId -and $childId -ne $ProcessId) {
-        Stop-ProcessTreeRobust -ProcessId $childId -ProtectedPids $ProtectedPids
+  # On Windows, taskkill /T /F is the most reliable way to tear down the
+  # wrapper + child tree in one shot, especially for powershell.exe launchers
+  # hosting Python/Celery workers.
+  try { taskkill /PID $ProcessId /T /F *> $null } catch { }
+  if (-not (Wait-ProcessExit -ProcessId $ProcessId -TimeoutSeconds 2 -PollMilliseconds 200)) {
+    # Fallback: recurse children via CIM, then force-stop the parent.
+    # Keep this path because taskkill can race or fail silently on some hosts.
+    try {
+      $children = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+          Where-Object { $_.ParentProcessId -eq $ProcessId } |
+          Select-Object -ExpandProperty ProcessId
+      )
+      foreach ($childId in (As-Array $children)) {
+        if ($childId -and $childId -ne $ProcessId) {
+          Stop-ProcessTreeRobust -ProcessId $childId -ProtectedPids $ProtectedPids
+        }
       }
-    }
-    if (Test-ProcessAlive -ProcessId $ProcessId) {
-      try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
-    }
-  } catch { }
+      if (Test-ProcessAlive -ProcessId $ProcessId) {
+        try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+      }
+    } catch { }
 
-  # Hard fallback: taskkill /T /F (kills full tree reliably)
-  if (Test-ProcessAlive -ProcessId $ProcessId) {
-    try { taskkill /PID $ProcessId /T /F *> $null } catch { }
+    # Final retry in case the process is still unwinding.
+    if (Test-ProcessAlive -ProcessId $ProcessId) {
+      try { taskkill /PID $ProcessId /T /F *> $null } catch { }
+    }
   }
 }
 
@@ -1113,15 +1143,13 @@ function Stop-ServiceProcess {
           Stop-ProcessTreeRobust -ProcessId $wrapperProc
         } catch { }
 
-        $waitSw = [Diagnostics.Stopwatch]::StartNew()
-        while ($waitSw.Elapsed.TotalSeconds -lt 8) {
-          if (-not (Test-ProcessAlive -ProcessId $wrapperProc)) { break }
-          Start-Sleep -Milliseconds 250
-        }
-
-        if (Test-ProcessAlive -ProcessId $wrapperProc) {
+        if (-not (Wait-ProcessExit -ProcessId $wrapperProc -TimeoutSeconds 8 -PollMilliseconds 250)) {
           Write-Host "[$instanceLabel] WARNING: wrapper PID $wrapperProc sigue vivo tras el stop; reintentando hard-kill."
           try { Stop-ProcessWithAncestorsRobust -ProcessId $wrapperProc } catch { }
+        }
+
+        if (-not (Wait-ProcessExit -ProcessId $wrapperProc -TimeoutSeconds 8 -PollMilliseconds 250)) {
+          Write-Host "[$instanceLabel] ERROR: wrapper PID $wrapperProc sigue vivo incluso tras hard-kill."
         }
       } else {
         Write-Host "[$instanceLabel] wrapper PID $wrapperProc ya no existe."
