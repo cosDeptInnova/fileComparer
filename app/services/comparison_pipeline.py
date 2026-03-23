@@ -3,20 +3,27 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from app.settings import settings
+from app.extractors import extract_document_result
 from app.llm_client import LLMClient
 from app.schemas import ChangeRow, ComparisonResult, ExtractedDocument
-from app.services.extractors import extract_text_from_path
 from app.services.normalization import normalize_text
 from app.services.postprocess import build_reconciliation_payload, merge_reconciled_rows
 from app.services.segmenter import TextBlock, build_blocks
+from app.settings import settings
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+@dataclass(slots=True)
+class ExtractionOptions:
+    engine: str = "auto"
+    soffice_path: str | None = None
+    drop_headers: bool = True
 
 
 @dataclass(slots=True)
@@ -33,10 +40,30 @@ def _token_overlap_score(a: str, b: str) -> float:
     return len(set_a & set_b) / len(set_a | set_b)
 
 
-def prepare_document(path: str | Path) -> PreparedDocument:
-    raw_text, metadata = extract_text_from_path(path)
+def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None = None) -> PreparedDocument:
+    extraction = extraction or ExtractionOptions()
+    extraction_result = extract_document_result(
+        str(path),
+        soffice_path=extraction.soffice_path,
+        drop_headers=extraction.drop_headers,
+        engine=extraction.engine,
+    )
+    raw_text = extraction_result.text
     clean_text = normalize_text(raw_text)
     blocks = build_blocks(clean_text, settings.block_target_chars, settings.block_overlap_chars)
+    quality_payload = extraction_result.to_quality_dict()
+    metadata = {
+        **dict(extraction_result.metadata),
+        "quality": quality_payload,
+        "quality_signals": dict(extraction_result.quality_signals),
+        "engine_requested": extraction.engine,
+        "engine_used": extraction_result.metadata.get("engine_used", extraction_result.engine),
+        "conversion": dict(extraction_result.metadata.get("conversion") or {"applied": False}),
+        "source_format_real": extraction_result.metadata.get("source_format_real") or Path(path).suffix.lower().lstrip("."),
+        "source_format": extraction_result.metadata.get("source_format") or Path(path).suffix.lower().lstrip("."),
+        "drop_headers": extraction.drop_headers,
+        "segment_count": len(blocks),
+    }
     document = ExtractedDocument(
         filename=Path(path).name,
         extension=Path(path).suffix.lower(),
@@ -119,11 +146,17 @@ def _reconcile_messages(rows: list[ChangeRow]) -> list[dict[str, str]]:
 
 
 def compare_documents(
-    path_a: str | Path, path_b: str | Path, sid: str, llm_client: LLMClient | None = None
+    path_a: str | Path,
+    path_b: str | Path,
+    sid: str,
+    llm_client: LLMClient | None = None,
+    *,
+    extraction: ExtractionOptions | None = None,
 ) -> ComparisonResult:
     client = llm_client or LLMClient()
-    prepared_a = prepare_document(path_a)
-    prepared_b = prepare_document(path_b)
+    extraction = extraction or ExtractionOptions()
+    prepared_a = prepare_document(path_a, extraction=extraction)
+    prepared_b = prepare_document(path_b, extraction=extraction)
     pairs = _pair_blocks(prepared_a.segments, prepared_b.segments)
     rows: list[ChangeRow] = []
     for index, pair in enumerate(pairs, start=1):
@@ -199,6 +232,7 @@ def compare_documents(
                 "doc_a_blocks": len(prepared_a.segments),
                 "doc_b_blocks": len(prepared_b.segments),
             },
+            "extraction": asdict(extraction),
             "pairing": {"strategy": "correlative_window_overlap", "pair_count": len(pairs)},
             "documents": {
                 "a": prepared_a.document.model_dump(),

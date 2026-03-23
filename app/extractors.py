@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import shutil
@@ -10,24 +11,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from charset_normalizer import from_bytes
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from PIL import Image
-from pptx import Presentation
 
 from .document_compare.extraction_layout import ExtractionBlock, ExtractionLayout
 
-SUPPORTED_TEXT_EXTENSIONS = {
-    ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf",
-    ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp",
-}
+ALWAYS_SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".docx", ".xlsx"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-LEGACY_OFFICE_EXTENSIONS = {".doc", ".xls", ".ppt", ".rtf"}
+LEGACY_OFFICE_EXTENSIONS = {".doc", ".xls", ".rtf"}
+SUPPORTED_TEXT_EXTENSIONS = ALWAYS_SUPPORTED_EXTENSIONS | LEGACY_OFFICE_EXTENSIONS | IMAGE_EXTENSIONS
+SUPPORTED_ENGINES = {"auto", "builtin", "docling"}
 _LIST_PREFIX_RX = re.compile(r"^(?:[\-–—•▪◦·●○■□]+|(?:\(?\d+(?:\.\d+)*[\)\.]|[a-z]\)|[ivxlcdm]+[\)\.]))\s+", re.IGNORECASE)
+
+
+class UnsupportedFormatError(ValueError):
+    pass
+
+
+class UnsupportedEngineError(ValueError):
+    pass
+
+
+class MissingDependencyError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -52,9 +62,99 @@ class ExtractionResult:
         }
 
 
-def normalize_requested_engine(engine: str | None) -> str:
+def normalize_requested_engine(engine: str | None, *, strict: bool = False) -> str:
     normalized = str(engine or "auto").strip().lower()
-    return normalized if normalized in {"auto", "builtin", "docling"} else "auto"
+    if normalized in SUPPORTED_ENGINES:
+        return normalized
+    if strict:
+        raise UnsupportedEngineError(
+            f"Engine no soportado: {normalized or 'vacío'}. Motores admitidos: {', '.join(sorted(SUPPORTED_ENGINES))}."
+        )
+    return "auto"
+
+
+def docling_available() -> bool:
+    return importlib.util.find_spec("docling") is not None
+
+
+def detect_ocr_backend() -> str | None:
+    if importlib.util.find_spec("rapidocr_onnxruntime") is not None:
+        return "rapidocr"
+    if importlib.util.find_spec("pytesseract") is not None and shutil.which("tesseract"):
+        return "tesseract"
+    return None
+
+
+def get_pipeline_capabilities(*, soffice_path: str | None = None) -> dict[str, Any]:
+    resolved_soffice = validate_soffice_option(soffice_path)
+    ocr_backend = detect_ocr_backend()
+    allowed_extensions = sorted(ALWAYS_SUPPORTED_EXTENSIONS)
+    if resolved_soffice:
+        allowed_extensions.extend(sorted(LEGACY_OFFICE_EXTENSIONS))
+    if ocr_backend:
+        allowed_extensions.extend(sorted(IMAGE_EXTENSIONS))
+
+    conditional_support = {
+        ext: {
+            "requires": "soffice",
+            "available": bool(resolved_soffice),
+            "detail": "Requiere LibreOffice headless para convertir a un formato OOXML antes de extraer.",
+        }
+        for ext in sorted(LEGACY_OFFICE_EXTENSIONS)
+    }
+
+    return {
+        "allowed_extensions": allowed_extensions,
+        "conditional_extensions": conditional_support,
+        "engines": {
+            "default": "auto",
+            "available": ["auto", "builtin", *(["docling"] if docling_available() else [])],
+            "declared": sorted(SUPPORTED_ENGINES),
+            "availability": {
+                "auto": True,
+                "builtin": True,
+                "docling": docling_available(),
+            },
+        },
+        "soffice": {
+            "available": bool(resolved_soffice),
+            "path": resolved_soffice,
+        },
+        "ocr": {
+            "available": bool(ocr_backend),
+            "backend": ocr_backend,
+        },
+    }
+
+
+def validate_extraction_request(path: str | Path, *, soffice_path: str | None = None, engine: str = "auto") -> tuple[str, str | None]:
+    normalized_engine = normalize_requested_engine(engine, strict=True)
+    ext = Path(path).suffix.lower()
+    if ext not in SUPPORTED_TEXT_EXTENSIONS:
+        raise UnsupportedFormatError(f"Formato no soportado: {ext or 'sin extensión'}")
+
+    resolved_soffice = validate_soffice_option(soffice_path)
+    if ext in LEGACY_OFFICE_EXTENSIONS and not resolved_soffice:
+        raise MissingDependencyError(
+            f"El formato {ext} solo está soportado condicionalmente y requiere LibreOffice/soffice disponible o una ruta válida en 'soffice'."
+        )
+
+    if ext in IMAGE_EXTENSIONS and not detect_ocr_backend():
+        raise MissingDependencyError(
+            f"El formato {ext} requiere un backend OCR disponible (RapidOCR o Tesseract)."
+        )
+
+    if normalized_engine == "docling" and not docling_available():
+        raise MissingDependencyError(
+            "Se solicitó engine=docling, pero Docling no está disponible en este despliegue."
+        )
+
+    if normalized_engine == "docling" and ext != ".pdf":
+        raise UnsupportedEngineError(
+            f"El engine docling solo está disponible para PDF en este pipeline. Formato recibido: {ext or 'sin extensión'}."
+        )
+
+    return normalized_engine, resolved_soffice
 
 
 def validate_soffice_option(value: str | None) -> str | None:
@@ -78,6 +178,15 @@ def extraction_is_reliable(opts: dict[str, Any] | None) -> bool:
     return min(float(qa.get("score") or 0.0), float(qb.get("score") or 0.0)) >= 0.5
 
 
+def _decode_text_bytes(content: bytes) -> str:
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
 def extract_document_text(path: str, *, soffice_path: str | None = None, drop_headers: bool = True, engine: str = "auto") -> tuple[str, dict[str, Any]]:
     result = extract_document_result(path, soffice_path=soffice_path, drop_headers=drop_headers, engine=engine)
     return result.text, result.to_quality_dict()
@@ -86,41 +195,88 @@ def extract_document_text(path: str, *, soffice_path: str | None = None, drop_he
 def extract_document_result(path: str, *, soffice_path: str | None = None, drop_headers: bool = True, engine: str = "auto") -> ExtractionResult:
     source = Path(path)
     ext = source.suffix.lower()
-    if ext not in SUPPORTED_TEXT_EXTENSIONS:
-        raise ValueError(f"Formato no soportado para extracción textual: {ext or 'sin extensión'}")
+    requested_engine, resolved_soffice = validate_extraction_request(source, soffice_path=soffice_path, engine=engine)
+
     if ext == ".txt":
-        return _extract_txt(source)
-    if ext == ".docx":
-        return _extract_docx(source)
-    if ext == ".xlsx":
-        return _extract_xlsx(source)
-    if ext == ".pptx":
-        return _extract_pptx(source)
-    if ext == ".pdf":
-        return _extract_pdf(source, drop_headers=drop_headers)
-    if ext in IMAGE_EXTENSIONS:
-        return _extract_image(source)
-    if ext in LEGACY_OFFICE_EXTENSIONS:
-        soffice = validate_soffice_option(soffice_path)
-        if not soffice:
-            raise RuntimeError(f"Se requiere LibreOffice/soffice para extraer {ext}")
-        converted = _convert_legacy(source, soffice)
+        result = _extract_txt(source)
+    elif ext == ".docx":
+        result = _extract_docx(source)
+    elif ext == ".xlsx":
+        result = _extract_xlsx(source)
+    elif ext == ".pdf":
+        result = _extract_pdf(source, drop_headers=drop_headers, engine=requested_engine)
+    elif ext in IMAGE_EXTENSIONS:
+        result = _extract_image(source)
+    elif ext in LEGACY_OFFICE_EXTENSIONS:
+        if not resolved_soffice:
+            raise MissingDependencyError(f"Se requiere LibreOffice/soffice para extraer {ext}")
+        converted = _convert_legacy(source, resolved_soffice)
         try:
-            return extract_document_result(str(converted), soffice_path=soffice, drop_headers=drop_headers, engine=engine)
+            nested = extract_document_result(
+                str(converted),
+                soffice_path=resolved_soffice,
+                drop_headers=drop_headers,
+                engine=requested_engine,
+            )
         finally:
             try:
                 converted.unlink(missing_ok=True)
             except Exception:
                 pass
-    raise ValueError(f"No hay extractor para {ext}")
+        metadata = {
+            **nested.metadata,
+            "source_format": nested.metadata.get("source_format") or converted.suffix.lower().lstrip("."),
+            "source_format_real": ext.lstrip("."),
+            "conversion": {
+                "applied": True,
+                "converter": "libreoffice",
+                "soffice_path": resolved_soffice,
+                "from_extension": ext,
+                "to_extension": converted.suffix.lower(),
+            },
+            "engine_requested": requested_engine,
+            "engine_used": nested.metadata.get("engine_used", nested.engine),
+        }
+        return ExtractionResult(
+            text=nested.text,
+            engine=nested.engine,
+            quality_score=nested.quality_score,
+            metadata=metadata,
+            blocks=nested.blocks,
+            quality_signals=nested.quality_signals,
+        )
+    else:
+        raise UnsupportedFormatError(f"No hay extractor para {ext or 'sin extensión'}")
+
+    metadata = {
+        **result.metadata,
+        "source_format": result.metadata.get("source_format") or ext.lstrip("."),
+        "source_format_real": ext.lstrip("."),
+        "conversion": result.metadata.get("conversion") or {"applied": False},
+        "engine_requested": requested_engine,
+        "engine_used": result.metadata.get("engine_used", result.engine),
+    }
+    return ExtractionResult(
+        text=result.text,
+        engine=result.engine,
+        quality_score=result.quality_score,
+        metadata=metadata,
+        blocks=result.blocks,
+        quality_signals=result.quality_signals,
+    )
 
 
 def _extract_txt(path: Path) -> ExtractionResult:
     content = path.read_bytes()
-    best = from_bytes(content).best()
-    text = str(best) if best is not None else content.decode("utf-8", errors="replace")
+    text = _decode_text_bytes(content)
     blocks = _simple_blocks_from_text(text, source_engine="txt")
-    return _result_from_layout(source_engine="txt", blocks=blocks, quality_score=1.0)
+    return _result_from_layout(
+        source_engine="txt",
+        extraction_engine="builtin",
+        blocks=blocks,
+        quality_score=1.0,
+        metadata={"source_format": "txt", "engine_used": "builtin"},
+    )
 
 
 def _extract_docx(path: Path) -> ExtractionResult:
@@ -155,7 +311,7 @@ def _extract_docx(path: Path) -> ExtractionResult:
         "table_row_count": sum(1 for block in blocks if block.block_type == "table_row"),
         "section_break_count": sum(1 for block in blocks if block.block_type == "section_break"),
     }
-    return _result_from_layout(source_engine="docx", blocks=blocks, quality_score=0.98, metadata=metadata)
+    return _result_from_layout(source_engine="docx", extraction_engine="builtin", blocks=blocks, quality_score=0.98, metadata={**metadata, "engine_used": "builtin"})
 
 
 def _extract_xlsx(path: Path) -> ExtractionResult:
@@ -175,10 +331,12 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
                         metadata={"sheet": sheet.title, "row_index": row_index, "column_count": len(values)},
                     )
                 )
-    return _result_from_layout(source_engine="xlsx", blocks=blocks, quality_score=0.96, metadata={"sheet_count": len(workbook.worksheets)})
+    return _result_from_layout(source_engine="xlsx", extraction_engine="builtin", blocks=blocks, quality_score=0.96, metadata={"source_format": "xlsx", "sheet_count": len(workbook.worksheets), "engine_used": "builtin"})
 
 
 def _extract_pptx(path: Path) -> ExtractionResult:
+    from pptx import Presentation
+
     presentation = Presentation(str(path))
     blocks: list[ExtractionBlock] = []
     for slide_index, slide in enumerate(presentation.slides, start=1):
@@ -199,7 +357,14 @@ def _extract_pptx(path: Path) -> ExtractionResult:
     return _result_from_layout(source_engine="pptx", blocks=blocks, quality_score=0.95, metadata={"slide_count": len(presentation.slides)})
 
 
-def _extract_pdf(path: Path, *, drop_headers: bool = True) -> ExtractionResult:
+def _extract_pdf(path: Path, *, drop_headers: bool = True, engine: str = "auto") -> ExtractionResult:
+    selected_engine = "docling" if engine == "docling" else "builtin"
+    if selected_engine == "docling":
+        return _extract_pdf_with_docling(path, drop_headers=drop_headers)
+    return _extract_pdf_with_builtin(path, drop_headers=drop_headers)
+
+
+def _extract_pdf_with_builtin(path: Path, *, drop_headers: bool = True) -> ExtractionResult:
     fitz = _load_pymupdf()
     doc = fitz.open(str(path))
     try:
@@ -215,19 +380,51 @@ def _extract_pdf(path: Path, *, drop_headers: bool = True) -> ExtractionResult:
         metadata = {
             "source_format": "pdf",
             "page_count": len(doc),
+            "engine_used": "builtin",
             **repeated,
         }
-        return _result_from_layout(source_engine="pdf", blocks=blocks, quality_score=0.93, metadata=metadata)
+        return _result_from_layout(source_engine="pdf", extraction_engine="builtin", blocks=blocks, quality_score=0.93, metadata=metadata)
     finally:
         doc.close()
 
 
+def _extract_pdf_with_docling(path: Path, *, drop_headers: bool = True) -> ExtractionResult:
+    if not docling_available():
+        raise MissingDependencyError("Docling no está disponible para procesar PDFs con engine=docling.")
+
+    from docling.document_converter import DocumentConverter  # type: ignore
+
+    converter = DocumentConverter()
+    converted = converter.convert(str(path))
+    document = getattr(converted, "document", converted)
+    markdown = ""
+    if hasattr(document, "export_to_markdown"):
+        markdown = str(document.export_to_markdown() or "")
+    elif hasattr(document, "text"):
+        markdown = str(getattr(document, "text") or "")
+    else:
+        markdown = str(document or "")
+    blocks = _simple_blocks_from_text(markdown, source_engine="pdf")
+    return _result_from_layout(
+        source_engine="pdf",
+        extraction_engine="docling",
+        blocks=blocks,
+        quality_score=0.94,
+        metadata={
+            "source_format": "pdf",
+            "drop_headers": drop_headers,
+            "engine_used": "docling",
+            "conversion": {"applied": False},
+        },
+    )
+
+
 def _extract_image(path: Path) -> ExtractionResult:
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception:
-        image = Image.open(path)
-        return ExtractionResult(text="", engine="image_no_ocr", quality_score=0.0, metadata={"size": image.size})
+    if importlib.util.find_spec("rapidocr_onnxruntime") is None:
+        return _extract_image_with_tesseract(path)
+
+    from rapidocr_onnxruntime import RapidOCR
+
     engine = RapidOCR()
     result, _ = engine(str(path))
     blocks: list[ExtractionBlock] = []
@@ -240,7 +437,21 @@ def _extract_image(path: Path) -> ExtractionResult:
             ys = [point[1] for point in item[0]]
             bbox = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
         blocks.append(ExtractionBlock(text=str(item[1]).strip(), page=1, block_type="line", source_engine="rapidocr", bbox=bbox, metadata={"ocr_index": index}))
-    return _result_from_layout(source_engine="rapidocr", blocks=blocks, quality_score=0.75 if blocks else 0.0, metadata={"source_format": "image"})
+    return _result_from_layout(source_engine="rapidocr", extraction_engine="rapidocr", blocks=blocks, quality_score=0.75 if blocks else 0.0, metadata={"source_format": "image", "engine_used": "rapidocr"})
+
+
+def _extract_image_with_tesseract(path: Path) -> ExtractionResult:
+    if importlib.util.find_spec("pytesseract") is None:
+        raise MissingDependencyError(
+            "No hay un backend OCR disponible para imágenes (RapidOCR o Tesseract)."
+        )
+
+    import pytesseract  # type: ignore
+
+    image = Image.open(path)
+    text = pytesseract.image_to_string(image, lang="spa+eng").strip()
+    blocks = _simple_blocks_from_text(text, source_engine="tesseract")
+    return _result_from_layout(source_engine="tesseract", extraction_engine="tesseract", blocks=blocks, quality_score=0.68 if text else 0.0, metadata={"source_format": "image", "size": image.size, "engine_used": "tesseract"})
 
 
 def _convert_legacy(path: Path, soffice_path: str) -> Path:
@@ -259,34 +470,26 @@ def _convert_legacy(path: Path, soffice_path: str) -> Path:
 
 
 def _load_pymupdf():
-    load_errors: list[str] = []
-
-    try:
-        import pymupdf as fitz  # type: ignore
+    pymupdf_spec = importlib.util.find_spec("pymupdf")
+    if pymupdf_spec is not None:
+        fitz = importlib.import_module("pymupdf")  # type: ignore
         if hasattr(fitz, "open"):
             return fitz
-        load_errors.append("`pymupdf` se importó pero no expone `open`.")
-    except Exception as exc:
-        load_errors.append(f"pymupdf: {exc}")
 
-    try:
-        import fitz  # type: ignore
+    fitz_spec = importlib.util.find_spec("fitz")
+    if fitz_spec is not None:
+        fitz = importlib.import_module("fitz")  # type: ignore
         if hasattr(fitz, "open"):
             return fitz
-        load_errors.append("`fitz` se importó pero no expone `open`; probablemente es el paquete incorrecto.")
-    except Exception as exc:
-        load_errors.append(f"fitz: {exc}")
 
-    detail = " | ".join(load_errors) if load_errors else "sin detalle adicional"
     raise RuntimeError(
         "No se pudo cargar PyMuPDF para procesar PDFs. "
         "Si aparece un error como `from frontend import *`, tienes instalado el paquete `fitz` incorrecto. "
-        "Solución recomendada: `pip uninstall -y fitz` y después `pip install --upgrade pymupdf`. "
-        f"Detalle: {detail}"
+        "Solución recomendada: `pip uninstall -y fitz` y después `pip install --upgrade pymupdf`."
     )
 
 
-def _result_from_layout(*, source_engine: str, blocks: list[ExtractionBlock], quality_score: float, metadata: dict[str, Any] | None = None) -> ExtractionResult:
+def _result_from_layout(*, source_engine: str, extraction_engine: str | None = None, blocks: list[ExtractionBlock], quality_score: float, metadata: dict[str, Any] | None = None) -> ExtractionResult:
     layout = ExtractionLayout(blocks=blocks, source_engine=source_engine, metadata=dict(metadata or {}))
     quality_signals = layout.quality_signals()
     metadata_dict = dict(metadata or {})
@@ -315,7 +518,7 @@ def _result_from_layout(*, source_engine: str, blocks: list[ExtractionBlock], qu
     adjusted_score = _adjust_quality_score(base_score=quality_score, signals=quality_signals)
     return ExtractionResult(
         text=layout.canonical_text(),
-        engine=source_engine,
+        engine=extraction_engine or source_engine,
         quality_score=adjusted_score,
         metadata=metadata_dict,
         blocks=blocks,

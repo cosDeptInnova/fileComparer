@@ -794,24 +794,14 @@ export async function fetchTextCompareCapabilities() {
  * FormData:
  *  - file_a: File
  *  - file_b: File
- *  - euro_mode: "strict" | "decimal" | "loose" (opcional)
- *  - min_euro: número (opcional)
+ *  - engine: auto | builtin | docling (opcional)
+ *  - soffice: ruta a LibreOffice/soffice para formatos condicionales (opcional)
  */
 export async function startTextCompareJob({ fileA, fileB, options = {} }) {
   const form = new FormData();
   form.append("file_a", fileA);
   form.append("file_b", fileB);
 
-  if (options?.euro_mode) {
-    form.append("euro_mode", String(options.euro_mode));
-  }
-  if (
-    options?.min_euro !== null &&
-    options?.min_euro !== undefined &&
-    options?.min_euro !== ""
-  ) {
-    form.append("min_euro", String(options.min_euro));
-  }
   if (options?.engine) {
     form.append("engine", String(options.engine));
   }

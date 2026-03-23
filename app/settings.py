@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.extractors import get_pipeline_capabilities
+
 
 def _env(*names: str, default: str) -> str:
     for name in names:
@@ -67,22 +69,18 @@ class Settings:
     llm_temperature: float = _env_float("LLAMA_CPP_TEMPERATURE", default=0)
     llm_max_tokens: int = _env_int("LLAMA_CPP_MAX_TOKENS", default=1800)
     csrf_cookie_name: str = _env("COMPARE_CSRF_COOKIE", default="csrftoken_app")
-    allowed_extensions: tuple[str, ...] = (
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".txt",
-        ".rtf",
-        ".xls",
-        ".xlsx",
-        ".png",
-        ".jpg",
-        ".jpeg",
-    )
 
     @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+    @property
+    def pipeline_capabilities(self) -> dict[str, object]:
+        return get_pipeline_capabilities()
+
+    @property
+    def allowed_extensions(self) -> tuple[str, ...]:
+        return tuple(self.pipeline_capabilities.get("allowed_extensions") or ())
 
     @property
     def accept(self) -> str:
