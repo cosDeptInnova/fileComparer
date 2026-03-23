@@ -379,59 +379,57 @@ def _persist_runtime_snapshot(
 ) -> None:
     try:
         from app.services.queue import persist_job_result, update_job_state
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("No se pudo persistir snapshot intermedio %s: %s", sid, exc)
-        return
-
-    visible_rows = deduplicate_rows(rows)
-    percent = 20 if total_pairs <= 0 else min(99, 20 + int((compared_pairs / total_pairs) * 75))
-    payload = {
-        "sid": sid,
-        "status": status,
-        "ok": status != "error",
-        "error": None,
-        "rows": _rows_to_payload(visible_rows),
-        "progress": {
-            "percent": percent if status == "running" else 100,
-            "step": step,
-            "detail": detail,
-            "completed_pairs": compared_pairs,
-            "total_pairs": total_pairs,
-            "failed_blocks": failed_blocks,
-            "fallback_blocks": fallback_blocks,
-        },
-        "meta": {
-            "partial_result": partial_result,
-            "pagination": {
-                "offset": 0,
-                "limit": None,
-                "returned": len(visible_rows),
-                "total": len(visible_rows),
-                "has_more": False,
-                "next_offset": None,
-                "truncated": False,
-            },
-            "cache": {
-                "policy": "incremental_result_file",
-                "resolved_from_cache": 0,
+        visible_rows = deduplicate_rows(rows)
+        percent = 20 if total_pairs <= 0 else min(99, 20 + int((compared_pairs / total_pairs) * 75))
+        payload = {
+            "sid": sid,
+            "status": status,
+            "ok": status != "error",
+            "error": None,
+            "rows": _rows_to_payload(visible_rows),
+            "progress": {
+                "percent": percent if status == "running" else 100,
+                "step": step,
+                "detail": detail,
+                "completed_pairs": compared_pairs,
+                "total_pairs": total_pairs,
                 "failed_blocks": failed_blocks,
                 "fallback_blocks": fallback_blocks,
             },
-        },
-    }
-    persist_job_result(sid, payload)
-    update_job_state(
-        sid,
-        status=status,
-        percent=payload["progress"]["percent"],
-        step=step,
-        detail=detail,
-        partial_result=partial_result,
-        failed_blocks=failed_blocks,
-        total_pairs=total_pairs,
-        completed_pairs=compared_pairs,
-        fallback_blocks=fallback_blocks,
-    )
+            "meta": {
+                "partial_result": partial_result,
+                "pagination": {
+                    "offset": 0,
+                    "limit": None,
+                    "returned": len(visible_rows),
+                    "total": len(visible_rows),
+                    "has_more": False,
+                    "next_offset": None,
+                    "truncated": False,
+                },
+                "cache": {
+                    "policy": "incremental_result_file",
+                    "resolved_from_cache": 0,
+                    "failed_blocks": failed_blocks,
+                    "fallback_blocks": fallback_blocks,
+                },
+            },
+        }
+        persist_job_result(sid, payload)
+        update_job_state(
+            sid,
+            status=status,
+            percent=payload["progress"]["percent"],
+            step=step,
+            detail=detail,
+            partial_result=partial_result,
+            failed_blocks=failed_blocks,
+            total_pairs=total_pairs,
+            completed_pairs=compared_pairs,
+            fallback_blocks=fallback_blocks,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudo persistir snapshot intermedio %s: %s", sid, exc)
 
 
 def compare_documents(
