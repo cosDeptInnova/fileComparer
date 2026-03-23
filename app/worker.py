@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import socket
 
-from rq import Connection, Worker
+from rq import Connection, SimpleWorker, Worker
 
 from app.settings import settings
 from app.services.queue import redis_connection
@@ -29,9 +29,22 @@ def build_worker_name() -> str:
     return f"{prefix}-{instance}-{hostname}-{pid}"
 
 
+def should_use_simple_worker() -> bool:
+    forced = os.getenv("COMPARE_USE_SIMPLE_WORKER", "").strip().lower()
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    return not hasattr(os, "fork")
+
+
+def worker_class() -> type[Worker]:
+    return SimpleWorker if should_use_simple_worker() else Worker
+
+
 def main() -> None:
     with Connection(redis_connection()):
-        worker = Worker([settings.rq_queue_name], name=build_worker_name())
+        worker = worker_class()([settings.rq_queue_name], name=build_worker_name())
         worker.work()
 
 

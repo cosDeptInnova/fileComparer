@@ -5,37 +5,47 @@ import sys
 import types
 
 
+class DummyRedis:
+    @classmethod
+    def from_url(cls, url, decode_responses=False):
+        return object()
+
+
+class DummyQueue:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class DummyConnection:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class DummyWorker:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class DummySimpleWorker(DummyWorker):
+    pass
+
+
 def _load_worker_module(monkeypatch):
     redis_mod = types.ModuleType("redis")
     rq_mod = types.ModuleType("rq")
-
-    class DummyRedis:
-        @classmethod
-        def from_url(cls, url, decode_responses=False):
-            return object()
-
-    class DummyQueue:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    class DummyConnection:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class DummyWorker:
-        def __init__(self, *args, **kwargs):
-            pass
 
     redis_mod.Redis = DummyRedis
     rq_mod.Queue = DummyQueue
     rq_mod.Connection = DummyConnection
     rq_mod.Worker = DummyWorker
+    rq_mod.SimpleWorker = DummySimpleWorker
 
     monkeypatch.setitem(sys.modules, "redis", redis_mod)
     monkeypatch.setitem(sys.modules, "rq", rq_mod)
@@ -62,3 +72,19 @@ def test_build_worker_name_honors_explicit_override(monkeypatch):
     worker_module = _load_worker_module(monkeypatch)
 
     assert worker_module.build_worker_name() == "comp_docs_worker-prod-a"
+
+
+def test_worker_class_uses_simple_worker_when_fork_is_unavailable(monkeypatch):
+    monkeypatch.delenv("COMPARE_USE_SIMPLE_WORKER", raising=False)
+    worker_module = _load_worker_module(monkeypatch)
+    monkeypatch.delattr(worker_module.os, "fork", raising=False)
+
+    assert worker_module.worker_class() is worker_module.SimpleWorker
+
+
+def test_worker_class_respects_force_disable_simple_worker(monkeypatch):
+    monkeypatch.setenv("COMPARE_USE_SIMPLE_WORKER", "false")
+    worker_module = _load_worker_module(monkeypatch)
+    monkeypatch.delattr(worker_module.os, "fork", raising=False)
+
+    assert worker_module.worker_class() is worker_module.Worker
