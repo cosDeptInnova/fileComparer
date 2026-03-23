@@ -38,20 +38,21 @@
       Name="comp_docs_worker"; Path="comp_docs";
       LaunchMode="python";
       Args=@("-m","app.worker");
-      ProcessCount=4;
+      ProcessCount=1;
       Env=@{
         COMPARE_PROCESS_ROLE="worker";
-        COMPARE_WORKER_IMPLEMENTATION="rq";
-        COMPARE_WORKER_CONCURRENCY="1";
+        COMPARE_WORKER_IMPLEMENTATION="celery";
+        COMPARE_WORKER_CONCURRENCY="4";
         COMPARE_QUEUE_NAME="compare";
         MAX_CONCURRENT_JOBS="4"
-        COMPARE_WINDOWS_WORKER_MODE="production"
+        COMPARE_MAX_INFLIGHT_JOBS="4"
+        COMPARE_CELERY_POOL="threads"
       };
       StartupFailureIsFatal=$true;
       RequireAllInstancesRunning=$true;
       StartupProbeDelayMs=1500;
       ReadyTimeoutSec=45;
-      ReadyLogPattern=@("Inicializando worker RQ:","*** Listening on compare...");
+      ReadyLogPattern=@("Inicializando worker Celery:","ready.");
       StopBeforeServices=@("comp_docs");
       EnvFile="comp_docs.env";
       Port=0

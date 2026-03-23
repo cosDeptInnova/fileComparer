@@ -1,8 +1,8 @@
 # Comparador documental local
 
-## Bug raíz
+## Cola de trabajo
 
-El worker por defecto de RQ (`rq worker` / `rq.Worker`) intenta usar `os.fork()`. En Windows eso rompe con `AttributeError: module 'os' has no attribute 'fork'`. Este proyecto ya no documenta ni arranca ese worker en Windows: hay una fábrica centralizada en `app/worker.py` que usa `SpawnWorker` cuando está disponible y aborta con un error explícito si alguien fuerza el worker clásico en Windows.
+El comparador ahora usa **Celery con Redis** como broker/backend para las colas de trabajo. La API publica tareas en la cola `COMPARE_QUEUE_NAME` y `comp_docs_worker` arranca workers Celery dedicados.
 
 ## Dependencias
 
@@ -10,7 +10,7 @@ El worker por defecto de RQ (`rq worker` / `rq.Worker`) intenta usar `os.fork()`
 python -m pip install -r requirements.txt
 ```
 
-> Requisito importante: `rq>=2.2,<3` para poder usar `rq.worker.SpawnWorker` en Windows.
+> Requisito importante: `celery[redis]>=5.4,<6` y un Redis accesible para broker/backend.
 
 ## Arranque local en Windows
 
@@ -40,17 +40,14 @@ También funciona directamente así:
 
 ```powershell
 cd /ruta/al/repo
-$env:COMPARE_WINDOWS_WORKER_MODE = "production"
-python -m app.worker --queue compare
+python -m app.worker --queue compare --pool threads --concurrency 4
 ```
 
 ### Windows: reglas operativas
 
-- **No uses `rq worker` en Windows.**
-- `python -m app.worker` selecciona `SpawnWorker` automáticamente si RQ 2.2+ está instalado.
-- Si `SpawnWorker` no está disponible:
-  - `COMPARE_WINDOWS_WORKER_MODE=production` aborta con error y pide subir RQ / mover producción a Linux.
-  - `COMPARE_WINDOWS_WORKER_MODE=development` permite fallback controlado a `SimpleWorker`, **solo para desarrollo**.
+- Usa `python -m app.worker` o los scripts del directorio `scripts`.
+- El wrapper usa `pool=threads` por defecto en Windows para evitar incompatibilidades de `prefork`.
+- Ajusta la concurrencia con `COMPARE_WORKER_CONCURRENCY` o `./start_worker.ps1 -Concurrency N`.
 - Para producción estable se recomienda ejecutar API + worker + Redis en **Linux, WSL2 o Docker**.
 
 ## Arranque local en Linux/macOS
@@ -76,7 +73,7 @@ cd scripts && ./start_api.sh
 O directamente:
 
 ```bash
-python -m app.worker --queue compare
+python -m app.worker --queue compare --concurrency 4
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload
 ```
 
@@ -95,6 +92,6 @@ curl -X POST http://127.0.0.1:8007/comparar \
 ## Scripts de servicio en Windows
 
 - `scripts/start-service.ps1 -Name comp_docs` arranca la API y su companion `comp_docs_worker`.
-- `scripts/stop-service.ps1 -Name comp_docs` baja la API y también los workers RQ asociados.
+- `scripts/stop-service.ps1 -Name comp_docs` baja la API y también los workers Celery asociados.
 - `scripts/stop-service.ps1 -Name comp_docs_worker` primero baja `comp_docs` y luego los workers, para evitar dejar `/comparar` expuesto sin consumidores.
 - Los scripts cargan `comp_docs.env` desde la raíz del repo si no existe `config\comp_docs.env`.

@@ -1,6 +1,8 @@
 param(
   [string[]]$Queue = @(),
-  [switch]$Burst
+  [switch]$Burst,
+  [int]$Concurrency = 0,
+  [string]$Pool = ""
 )
 
 Set-StrictMode -Version Latest
@@ -15,10 +17,6 @@ if (-not $env:PYTHONPATH) {
   $env:PYTHONPATH = "$($env:PYTHONPATH)$([IO.Path]::PathSeparator)$repoRoot"
 }
 
-if (-not $env:COMPARE_WINDOWS_WORKER_MODE) {
-  $env:COMPARE_WINDOWS_WORKER_MODE = "production"
-}
-
 $argsList = @("-m", "app.worker")
 if ($Queue.Count -gt 0) {
   foreach ($queueName in $Queue) {
@@ -28,6 +26,8 @@ if ($Queue.Count -gt 0) {
   $argsList += @("--queue", $(if ($env:COMPARE_QUEUE_NAME) { $env:COMPARE_QUEUE_NAME } else { "compare" }))
 }
 if ($Burst) { $argsList += "--burst" }
+if ($Concurrency -gt 0) { $argsList += @("--concurrency", [string]$Concurrency) }
+if ($Pool) { $argsList += @("--pool", $Pool) }
 
-Write-Host "[comp_docs_worker] Windows detected. DO NOT use 'rq worker' here; launching python $($argsList -join ' ')" -ForegroundColor Cyan
+Write-Host "[comp_docs_worker] launching Celery worker via python $($argsList -join ' ')" -ForegroundColor Cyan
 & python @argsList

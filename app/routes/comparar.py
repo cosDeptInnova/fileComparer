@@ -151,8 +151,8 @@ async def comparar(
         percent=5,
         step="encolado",
         detail="Esperando worker",
-        queue_name=settings.rq_queue_name,
-        queue_backend="rq",
+        queue_name=settings.compare_queue_name,
+        queue_backend="celery",
         original_filename_a=name_a,
         original_filename_b=name_b,
         stored_filename_a=path_a.name,
@@ -201,7 +201,7 @@ def progress(sid: str) -> dict[str, object]:
         "step": state.get("step", "pendiente"),
         "detail": state.get("detail", ""),
         "error": state.get("error"),
-        "metrics": {"queue": {"backend": "rq", "name": settings.rq_queue_name}},
+        "metrics": {"queue": {"backend": "celery", "name": settings.compare_queue_name}},
     }
 
 
