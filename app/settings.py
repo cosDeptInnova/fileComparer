@@ -65,6 +65,14 @@ class Settings:
         "COMPARE_LLM_TIMEOUT_SECONDS",
         default=120,
     )
+    compare_failed_blocks_error_ratio: float = _env_float(
+        "COMPARE_FAILED_BLOCKS_ERROR_RATIO",
+        default=0.5,
+    )
+    compare_reconcile_min_rows: int = _env_int(
+        "COMPARE_RECONCILE_MIN_ROWS",
+        default=2,
+    )
     llm_max_retries: int = _env_int("LLAMA_CPP_MAX_RETRIES", default=3)
     llm_temperature: float = _env_float("LLAMA_CPP_TEMPERATURE", default=0)
     llm_max_tokens: int = _env_int("LLAMA_CPP_MAX_TOKENS", default=1800)

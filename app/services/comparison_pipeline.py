@@ -197,6 +197,31 @@ Devuelve JSON estricto con la misma forma {\"changes\":[...]}.
 Si todos los hallazgos ya son consistentes, devuelve los mismos sin duplicados."""
 
 
+def _safe_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def _build_error_summary(*, pair_id: str, stage: str, exc: Exception) -> dict[str, str]:
+    return {
+        "pair_id": pair_id,
+        "stage": stage,
+        "error_type": exc.__class__.__name__,
+        "message": _safe_error_message(exc),
+    }
+
+
+def _resolve_result_status(*, failed_blocks: int, total_pairs: int) -> str:
+    if total_pairs <= 0:
+        return "done"
+    failed_ratio = failed_blocks / total_pairs
+    if failed_blocks <= 0:
+        return "done"
+    if failed_ratio >= settings.compare_failed_blocks_error_ratio:
+        return "error"
+    return "done_with_warnings"
+
+
 def _comparison_messages(block_a: TextBlock | None, block_b: TextBlock | None) -> list[dict[str, str]]:
     payload = {
         "block_a": {
@@ -237,6 +262,7 @@ def compare_documents(
     prepared_a = prepare_document(path_a, extraction=extraction)
     prepared_b = prepare_document(path_b, extraction=extraction)
     pairs = _pair_blocks(prepared_a.segments, prepared_b.segments)
+    failure_threshold = max(0, int(len(pairs) * settings.compare_failed_blocks_error_ratio)) if pairs else 0
     pairing_counts = {
         "matched_pairs": sum(1 for pair in pairs if pair["pair_type"] == "matched"),
         "orphan_a": sum(1 for pair in pairs if pair["pair_type"] == "orphan_a"),
@@ -244,15 +270,31 @@ def compare_documents(
         "reanchored_pairs": sum(1 for pair in pairs if pair["pair_type"] == "reanchored"),
     }
     rows: list[ChangeRow] = []
+    diagnostics_errors: list[dict[str, str]] = []
+    failed_blocks = 0
+    compared_pairs = 0
+    threshold_reached = False
     for index, pair in enumerate(pairs, start=1):
+        compared_pairs = index
         block_a = pair["a"]
         block_b = pair["b"]
-        llm_response = client.compare(_comparison_messages(block_a, block_b))
+        pair_id = f"{sid}-{index}"
+        try:
+            llm_response = client.compare(_comparison_messages(block_a, block_b))
+        except Exception as exc:  # noqa: BLE001
+            failed_blocks += 1
+            error_summary = _build_error_summary(pair_id=pair_id, stage="compare_pair", exc=exc)
+            diagnostics_errors.append(error_summary)
+            logger.exception("Error comparando pareja %s", pair_id)
+            if failed_blocks > failure_threshold:
+                threshold_reached = True
+                break
+            continue
         for change in llm_response.changes:
             rows.append(
                 ChangeRow(
                     block_id=len(rows) + 1,
-                    pair_id=f"{sid}-{index}",
+                    pair_id=pair_id,
                     text_a=change.source_a,
                     text_b=change.source_b,
                     display_text_a=change.source_a or ("" if block_a is None else block_a.text),
@@ -281,13 +323,58 @@ def compare_documents(
                     },
                 )
             )
-    reconciled = client.compare(_reconcile_messages(rows)) if rows else None
+    valid_rows_for_reconciliation = len(rows) >= settings.compare_reconcile_min_rows
+    reconciled = None
+    reconciliation_used = False
+    reconciliation_failed = False
+    if valid_rows_for_reconciliation:
+        try:
+            reconciled = client.compare(_reconcile_messages(rows))
+            reconciliation_used = True
+        except Exception as exc:  # noqa: BLE001
+            reconciliation_failed = True
+            diagnostics_errors.append(
+                _build_error_summary(pair_id=f"{sid}-reconcile", stage="reconcile", exc=exc)
+            )
+            logger.exception("Error reconciliando resultado %s", sid)
     final_rows = merge_reconciled_rows(rows, reconciled)
+    failed_ratio = (failed_blocks / len(pairs)) if pairs else 0.0
+    partial_result = failed_blocks > 0 or threshold_reached or reconciliation_failed
+    status = _resolve_result_status(failed_blocks=failed_blocks, total_pairs=len(pairs))
+    error_summary = {
+        "failed_blocks": failed_blocks,
+        "total_pairs": len(pairs),
+        "failed_ratio": failed_ratio,
+        "threshold": failure_threshold,
+        "threshold_reached": threshold_reached,
+        "reconciliation_failed": reconciliation_failed,
+        "reconciliation_used": reconciliation_used,
+        "reconciliation_skipped": not valid_rows_for_reconciliation,
+        "valid_rows_before_reconciliation": len(rows),
+        "errors": diagnostics_errors,
+    }
     return ComparisonResult(
         sid=sid,
-        status="done",
-        progress={"percent": 100, "step": "completado", "detail": "Comparación finalizada"},
+        status=status,
+        progress={
+            "percent": 100,
+            "step": "completado" if status != "error" else "completado_con_errores",
+            "detail": (
+                "Comparación finalizada"
+                if not partial_result
+                else "Comparación finalizada con resultado parcial"
+            ),
+            "completed_pairs": compared_pairs,
+            "total_pairs": len(pairs),
+            "failed_blocks": failed_blocks,
+        },
         rows=final_rows,
+        ok=status != "error",
+        error=(
+            None
+            if status == "done"
+            else f"Resultado parcial: {failed_blocks} de {len(pairs)} bloques fallidos"
+        ),
         meta={
             "pagination": {
                 "offset": 0,
@@ -307,7 +394,7 @@ def compare_documents(
                 "policy": "no-store",
                 "resolved_from_cache": 0,
                 "resolved_by_llm": len(final_rows),
-                "failed_blocks": 0,
+                "failed_blocks": failed_blocks,
                 "block_size_words": 0,
                 "block_overlap_words": 0,
                 "model_name": client.model_name,
@@ -325,6 +412,21 @@ def compare_documents(
                 "pair_count": len(pairs),
                 **pairing_counts,
             },
+            "diagnostics": {
+                "failed_blocks": failed_blocks,
+                "compared_pairs": compared_pairs,
+                "total_pairs": len(pairs),
+                "failed_ratio": failed_ratio,
+                "partial_result": partial_result,
+                "threshold": failure_threshold,
+                "threshold_reached": threshold_reached,
+                "reconciliation_attempted": valid_rows_for_reconciliation,
+                "reconciliation_failed": reconciliation_failed,
+                "reconciliation_used": reconciliation_used,
+                "errors": diagnostics_errors,
+            },
+            "partial_result": partial_result,
+            "error_summary": error_summary,
             "documents": {
                 "a": prepared_a.document.model_dump(),
                 "b": prepared_b.document.model_dump(),
