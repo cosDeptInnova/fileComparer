@@ -42,7 +42,7 @@ const SEVERITY_FILTER_OPTIONS = [
 const CHANGE_FILTER_OPTIONS = [
   { value: TEXT_COMPARE_FILTER_ALL, label: "Todos los cambios" },
   { value: "modificado", label: "Modificado" },
-  { value: "insertado", label: "Solo en B" },
+  { value: "añadido", label: "Solo en B" },
   { value: "eliminado", label: "Solo en A" },
   { value: "pendiente_confirmacion", label: "Sin clasificar" },
 ];
@@ -195,6 +195,7 @@ function toneForChangeType(changeType) {
     case "modificado":
       return "purple";
     case "insertado":
+    case "añadido":
       return "success";
     case "eliminado":
       return "danger";
