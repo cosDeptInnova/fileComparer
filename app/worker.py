@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 
-from rq import Connection, Worker
-
 from app.settings import settings
 from app.services.queue import redis_connection
 
@@ -14,7 +12,13 @@ def build_worker_name() -> str:
     return f"{prefix}-{instance}"
 
 
-if __name__ == "__main__":
+def main() -> None:
+    from rq import Connection, Worker
+
     with Connection(redis_connection()):
         worker = Worker([settings.rq_queue_name], name=build_worker_name())
         worker.work()
+
+
+if __name__ == "__main__":
+    main()

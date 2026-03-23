@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-
-from redis import Redis
-from rq import Queue
+from typing import TYPE_CHECKING, Any
 
 from app.settings import settings
 
+if TYPE_CHECKING:
+    from redis import Redis
+    from rq import Queue
+
 
 def redis_connection() -> Redis:
-    return Redis.from_url(settings.redis_url, decode_responses=True)
+    from redis import Redis
+
+    return Redis.from_url(settings.redis_url, decode_responses=False)
 
 
 def compare_queue() -> Queue:
+    from rq import Queue
+
     return Queue(
         settings.rq_queue_name,
         connection=redis_connection(),
@@ -41,10 +47,12 @@ def read_job_state(sid: str) -> dict[str, object]:
     raw = redis_connection().hgetall(job_key(sid))
     parsed: dict[str, object] = {}
     for key, value in raw.items():
+        normalized_key = _decode_redis_scalar(key)
+        normalized_value = _decode_redis_scalar(value)
         try:
-            parsed[key] = json.loads(value)
+            parsed[normalized_key] = json.loads(normalized_value)
         except Exception:
-            parsed[key] = value
+            parsed[normalized_key] = normalized_value
     return parsed
 
 
@@ -61,3 +69,9 @@ def load_job_result(sid: str) -> dict[str, object] | None:
     if not output_path.exists():
         return None
     return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def _decode_redis_scalar(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)

@@ -259,17 +259,31 @@ def _convert_legacy(path: Path, soffice_path: str) -> Path:
 
 
 def _load_pymupdf():
+    load_errors: list[str] = []
+
     try:
         import pymupdf as fitz  # type: ignore
-        return fitz
-    except Exception:
-        try:
-            import fitz  # type: ignore
+        if hasattr(fitz, "open"):
             return fitz
-        except Exception as exc:
-            raise RuntimeError(
-                "No se pudo importar PyMuPDF. Verifica que esté instalado `pymupdf` y que no exista el paquete incompatible `fitz`."
-            ) from exc
+        load_errors.append("`pymupdf` se importó pero no expone `open`.")
+    except Exception as exc:
+        load_errors.append(f"pymupdf: {exc}")
+
+    try:
+        import fitz  # type: ignore
+        if hasattr(fitz, "open"):
+            return fitz
+        load_errors.append("`fitz` se importó pero no expone `open`; probablemente es el paquete incorrecto.")
+    except Exception as exc:
+        load_errors.append(f"fitz: {exc}")
+
+    detail = " | ".join(load_errors) if load_errors else "sin detalle adicional"
+    raise RuntimeError(
+        "No se pudo cargar PyMuPDF para procesar PDFs. "
+        "Si aparece un error como `from frontend import *`, tienes instalado el paquete `fitz` incorrecto. "
+        "Solución recomendada: `pip uninstall -y fitz` y después `pip install --upgrade pymupdf`. "
+        f"Detalle: {detail}"
+    )
 
 
 def _result_from_layout(*, source_engine: str, blocks: list[ExtractionBlock], quality_score: float, metadata: dict[str, Any] | None = None) -> ExtractionResult:
