@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from redis import Redis
 from rq import Queue
@@ -9,8 +10,17 @@ from rq import Queue
 from app.settings import settings
 
 
+def _decode_if_bytes(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def redis_connection() -> Redis:
-    return Redis.from_url(settings.redis_url, decode_responses=True)
+    # RQ almacena payloads binarios (pickles/zlib) y necesita recibir bytes desde Redis.
+    # Si decode_responses=True, redis-py convierte respuestas a str y RQ termina intentando
+    # hacer .decode() sobre ellas o decodificando binario arbitrario como UTF-8.
+    return Redis.from_url(settings.redis_url, decode_responses=False)
 
 
 def compare_queue() -> Queue:
@@ -40,7 +50,9 @@ def update_job_state(job_id: str, **fields: object) -> None:
 def read_job_state(sid: str) -> dict[str, object]:
     raw = redis_connection().hgetall(job_key(sid))
     parsed: dict[str, object] = {}
-    for key, value in raw.items():
+    for raw_key, raw_value in raw.items():
+        key = _decode_if_bytes(raw_key)
+        value = _decode_if_bytes(raw_value)
         try:
             parsed[key] = json.loads(value)
         except Exception:
