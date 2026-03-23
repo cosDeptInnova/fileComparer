@@ -67,6 +67,7 @@ class CompareWorkerService:
             wait_sleep_seconds=float(os.getenv("COMPARE_EXECUTION_WAIT_SLEEP_SECONDS", "0.1")),
         )
         self._last_orphan_recovery_at = 0.0
+        self._last_execution_slot_recovery_at = 0.0
 
     def run_forever(self) -> None:
         self.queue.ensure_group()
@@ -90,18 +91,42 @@ class CompareWorkerService:
 
                 execution_lease = self.execution_semaphore.acquire(blocking=False)
                 if self.execution_semaphore.enabled() and execution_lease is None:
+                    self._maybe_recover_execution_slots()
                     time.sleep(0.1)
                     continue
                 try:
                     payload, _entry = self.queue.dequeue_claim(worker_id=self.worker_id, timeout_seconds=self.settings.dequeue_timeout_seconds)
                     if payload is None:
                         continue
-                    self._process(payload)
+                    self._process(payload, execution_lease=execution_lease)
                 finally:
                     self.execution_semaphore.release(execution_lease)
         finally:
             self.queue.unregister_worker(self.worker_id)
             set_compare_active_workers(self.queue.count_active_workers())
+
+    def _maybe_recover_execution_slots(self) -> None:
+        if not self.execution_semaphore.enabled():
+            return
+        now = time.monotonic()
+        min_interval = max(self.settings.heartbeat_interval, 1.0)
+        if now - self._last_execution_slot_recovery_at < min_interval:
+            return
+        self._last_execution_slot_recovery_at = now
+        try:
+            active_owner_ids = set(self.queue.worker_snapshot().keys())
+            active_owner_ids.add(self.worker_id)
+            recovered = self.execution_semaphore.reap_orphaned_slots(active_owner_ids=active_owner_ids)
+        except Exception:
+            LOGGER.exception("Compare worker failed recovering execution semaphore slots worker_id=%s", self.worker_id)
+            return
+        if recovered > 0:
+            LOGGER.warning(
+                "Compare worker recovered orphaned execution slots worker_id=%s recovered=%s semaphore=%s",
+                self.worker_id,
+                recovered,
+                self.execution_semaphore.name,
+            )
 
     def _maybe_recover_orphaned_tasks(self) -> None:
         now = time.monotonic()
@@ -129,7 +154,7 @@ class CompareWorkerService:
             LOGGER.exception("Compare worker failed checking terminal state sid=%s", sid)
             return False
 
-    def _start_task_heartbeat(self, sid: str) -> tuple[threading.Event, threading.Thread]:
+    def _start_task_heartbeat(self, sid: str, *, execution_lease: str | None = None) -> tuple[threading.Event, threading.Thread]:
         stop_event = threading.Event()
 
         def _loop() -> None:
@@ -140,6 +165,8 @@ class CompareWorkerService:
                         active_jobs=1,
                         concurrency=self.settings.concurrency,
                     )
+                    if execution_lease:
+                        self.execution_semaphore.renew(execution_lease)
                     self.queue.touch_task(sid, worker_id=self.worker_id)
                 except Exception:
                     LOGGER.exception(
@@ -158,18 +185,20 @@ class CompareWorkerService:
             active_jobs=1,
             concurrency=self.settings.concurrency,
         )
+        if execution_lease:
+            self.execution_semaphore.renew(execution_lease)
         self.queue.touch_task(sid, worker_id=self.worker_id)
         thread.start()
         return stop_event, thread
 
-    def _process(self, task: CompareTaskPayload) -> None:
+    def _process(self, task: CompareTaskPayload, *, execution_lease: str | None = None) -> None:
         if self._job_is_terminal(task.sid):
             LOGGER.info("Compare worker skipping already-terminal job before processing sid=%s worker_id=%s", task.sid, self.worker_id)
             self.queue.release_task(task.sid)
             return
         record_job_event("worker:job_started")
         self.job_store.update_progress_sync(task.sid, percent=10, step="extraccion", detail="Procesando comparación")
-        heartbeat_stop, heartbeat_thread = self._start_task_heartbeat(task.sid)
+        heartbeat_stop, heartbeat_thread = self._start_task_heartbeat(task.sid, execution_lease=execution_lease)
         llm_client = None
         if self.settings.llm_base_url:
             llm_client = LLMClient(
