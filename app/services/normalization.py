@@ -15,6 +15,8 @@ SOFT_HYPHEN_RE = re.compile("\u00ad")
 MULTI_PUNCT_RE = re.compile(r"([,.;:])\1+")
 MULTI_DASH_RE = re.compile(r"[–—]{2,}")
 SENTENCE_SPACE_RE = re.compile(r"\s+([,.;:])")
+LAYOUT_ARTIFACT_RE = re.compile(r"(?m)^[\s\-_.,=~*]{3,}$")
+UNICODE_BREAK_RE = re.compile(r"[\u2028\u2029\u0085]")
 NUMBERING_ONLY_LINE_RE = re.compile(
     r"(?im)^\s*(?:[ivxlcdm]+[\)\.]|\(?\d+(?:\.\d+)*[\)\.]|[a-z]\))\s*$"
 )
@@ -32,7 +34,9 @@ def _drop_repeated_edge_lines(lines: list[str]) -> list[str]:
 
 def normalize_text(raw_text: str) -> str:
     text = raw_text or ""
+    text = UNICODE_BREAK_RE.sub("\n", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\x0c", "\n")
     text = SOFT_HYPHEN_RE.sub("", text)
     text = LINE_BREAK_HYPHEN_RE.sub(r"\1\2", text)
     text = MULTI_NEWLINE_RE.sub(f"\n{PARAGRAPH_BREAK_TOKEN}\n", text)
@@ -40,6 +44,7 @@ def normalize_text(raw_text: str) -> str:
     text = BULLET_RE.sub("", text)
     text = PAGE_LABEL_RE.sub("", text)
     text = OCR_NOISE_RE.sub("", text)
+    text = LAYOUT_ARTIFACT_RE.sub("", text)
     text = "\n".join(line.strip() for line in text.split("\n"))
     lines = [line for line in text.split("\n") if line.strip()]
     lines = _drop_repeated_edge_lines(lines)
