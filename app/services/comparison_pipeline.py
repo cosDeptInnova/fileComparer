@@ -24,7 +24,7 @@ GAP_PENALTY = 0.35
 MERGE_PENALTY = 0.18
 ANCHOR_SIMILARITY_THRESHOLD = 0.72
 SEMANTIC_EQUALITY_THRESHOLD = 0.93
-NOISE_EQUIVALENCE_THRESHOLD = 0.84
+NOISE_EQUIVALENCE_THRESHOLD = 0.75
 MIN_MATCH_SIMILARITY = 0.58
 
 
@@ -271,6 +271,56 @@ def _pair_blocks(blocks_a: list[TextBlock], blocks_b: list[TextBlock]) -> list[d
             and normalize_text(current["b"].text) == normalize_text(nxt["b"].text)
         ):
             pairs[index], pairs[index + 1] = pairs[index + 1], pairs[index]
+    repaired_pairs: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(pairs):
+        current = pairs[cursor]
+        nxt = pairs[cursor + 1] if cursor + 1 < len(pairs) else None
+        if (
+            nxt is not None
+            and current["a"] is None
+            and current["b"] is not None
+            and nxt["a"] is not None
+            and nxt["b"] is None
+        ):
+            similarity = _text_similarity(nxt["a"].text, current["b"].text)
+            if similarity >= 0.76:
+                repaired_pairs.append(
+                    {
+                        "a": nxt["a"],
+                        "b": current["b"],
+                        "a_blocks": nxt["a_blocks"],
+                        "b_blocks": current["b_blocks"],
+                        "alignment_score": similarity,
+                        "match_reason": "orphan_swap_repair",
+                    }
+                )
+                cursor += 2
+                continue
+        if (
+            nxt is not None
+            and current["a"] is not None
+            and current["b"] is None
+            and nxt["a"] is None
+            and nxt["b"] is not None
+        ):
+            similarity = _text_similarity(current["a"].text, nxt["b"].text)
+            if similarity >= 0.76:
+                repaired_pairs.append(
+                    {
+                        "a": current["a"],
+                        "b": nxt["b"],
+                        "a_blocks": current["a_blocks"],
+                        "b_blocks": nxt["b_blocks"],
+                        "alignment_score": similarity,
+                        "match_reason": "orphan_swap_repair",
+                    }
+                )
+                cursor += 2
+                continue
+        repaired_pairs.append(current)
+        cursor += 1
+    pairs = repaired_pairs
     last_matched_a: int | None = None
     last_matched_b: int | None = None
     for pair in pairs:
@@ -464,7 +514,9 @@ def _heuristic_compare_pair(
         return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
     lexical_overlap = _token_overlap_score(norm_a, norm_b)
     semantic_similarity = _text_similarity(norm_a, norm_b)
-    if lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD and semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD:
+    if lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD and semantic_similarity >= (SEMANTIC_EQUALITY_THRESHOLD - 0.03):
+        return LLMComparisonResponse.model_validate({"changes": []}), "format_noise_equivalent"
+    if semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD and _relative_length_score(norm_a, norm_b) >= 0.9:
         return LLMComparisonResponse.model_validate({"changes": []}), "format_noise_equivalent"
     return None
 
@@ -653,6 +705,7 @@ def compare_documents(
         failed_blocks = 0
         fallback_blocks = 0
         cache_hits = 0
+        llm_pairs = 0
         llm_pair_cache: dict[str, LLMComparisonResponse] = {}
         llm_generated_rows = 0
         fallback_generated_rows = 0
@@ -701,6 +754,7 @@ def compare_documents(
                         )
                         llm_pair_cache[cache_key] = llm_response
                         row_source = "llm"
+                        llm_pairs += 1
                     except Exception as exc:  # noqa: BLE001
                         if isinstance(exc, LLMResponseError):
                             fallback_blocks += 1
@@ -917,6 +971,10 @@ def compare_documents(
                     **pairing_counts,
                 },
                 "diagnostics": {
+                    "counts": {
+                        "pairs_sent_to_llm": llm_pairs,
+                        "final_review_actions": 0,
+                    },
                     "failed_blocks": failed_blocks,
                     "fallback_blocks": fallback_blocks,
                     "compared_pairs": compared_pairs,
