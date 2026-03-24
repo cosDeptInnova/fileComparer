@@ -10,7 +10,7 @@ from typing import Any
 
 from app.extractors import extract_document_result
 from app.llm_client import LLMClient, LLMResponseError
-from app.schemas import ChangeRow, ComparisonResult, ExtractedDocument, LLMComparisonResponse
+from app.schemas import ChangeRow, ComparisonResult, DiffSegment, ExtractedDocument, LLMComparisonResponse
 from app.services.normalization import normalize_text
 from app.services.postprocess import deduplicate_rows
 from app.services.segmenter import TextBlock, build_blocks
@@ -24,7 +24,7 @@ GAP_PENALTY = 0.35
 MERGE_PENALTY = 0.18
 ANCHOR_SIMILARITY_THRESHOLD = 0.72
 SEMANTIC_EQUALITY_THRESHOLD = 0.93
-NOISE_EQUIVALENCE_THRESHOLD = 0.75
+NOISE_EQUIVALENCE_THRESHOLD = 0.84
 MIN_MATCH_SIMILARITY = 0.58
 
 
@@ -80,7 +80,7 @@ def _block_similarity(block_a: TextBlock, block_b: TextBlock, total_a: int, tota
     semantic = _text_similarity(block_a.text, block_b.text)
     length_score = _relative_length_score(block_a.text, block_b.text)
     position_score = _relative_position_score(block_a.index, total_a, block_b.index, total_b)
-    return (overlap * 0.4) + (semantic * 0.25) + (length_score * 0.15) + (position_score * 0.2)
+    return (overlap * 0.45) + (semantic * 0.35) + (length_score * 0.10) + (position_score * 0.10)
 
 
 def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None = None) -> PreparedDocument:
@@ -271,56 +271,6 @@ def _pair_blocks(blocks_a: list[TextBlock], blocks_b: list[TextBlock]) -> list[d
             and normalize_text(current["b"].text) == normalize_text(nxt["b"].text)
         ):
             pairs[index], pairs[index + 1] = pairs[index + 1], pairs[index]
-    repaired_pairs: list[dict[str, Any]] = []
-    cursor = 0
-    while cursor < len(pairs):
-        current = pairs[cursor]
-        nxt = pairs[cursor + 1] if cursor + 1 < len(pairs) else None
-        if (
-            nxt is not None
-            and current["a"] is None
-            and current["b"] is not None
-            and nxt["a"] is not None
-            and nxt["b"] is None
-        ):
-            similarity = _text_similarity(nxt["a"].text, current["b"].text)
-            if similarity >= 0.76:
-                repaired_pairs.append(
-                    {
-                        "a": nxt["a"],
-                        "b": current["b"],
-                        "a_blocks": nxt["a_blocks"],
-                        "b_blocks": current["b_blocks"],
-                        "alignment_score": similarity,
-                        "match_reason": "orphan_swap_repair",
-                    }
-                )
-                cursor += 2
-                continue
-        if (
-            nxt is not None
-            and current["a"] is not None
-            and current["b"] is None
-            and nxt["a"] is None
-            and nxt["b"] is not None
-        ):
-            similarity = _text_similarity(current["a"].text, nxt["b"].text)
-            if similarity >= 0.76:
-                repaired_pairs.append(
-                    {
-                        "a": current["a"],
-                        "b": nxt["b"],
-                        "a_blocks": current["a_blocks"],
-                        "b_blocks": nxt["b_blocks"],
-                        "alignment_score": similarity,
-                        "match_reason": "orphan_swap_repair",
-                    }
-                )
-                cursor += 2
-                continue
-        repaired_pairs.append(current)
-        cursor += 1
-    pairs = repaired_pairs
     last_matched_a: int | None = None
     last_matched_b: int | None = None
     for pair in pairs:
@@ -360,7 +310,9 @@ Devuelve JSON estricto con esta forma: {\"changes\":[{\"change_type\":\"añadido
 Si no hay cambios, responde {\"changes\":[]}.
 No dupliques hallazgos. Sé prudente cuando la evidencia sea débil."""
 
-PAIR_PROMPT_CHAR_LIMIT = 250
+def _max_pair_chars() -> int:
+    available_tokens = settings.context_window_tokens - settings.llm_max_tokens - 600
+    return max(500, int(available_tokens * 4) // 2)
 
 
 def _build_fixed_chunks(text: str, chunk_chars: int) -> list[TextBlock]:
@@ -441,14 +393,52 @@ def _resolve_result_status(*, failed_blocks: int, total_pairs: int, fallback_blo
     return "done_with_warnings"
 
 
-def _excerpt_for_prompt(text: str, *, limit: int = PAIR_PROMPT_CHAR_LIMIT) -> tuple[str, bool]:
+def _excerpt_for_prompt(text: str, *, limit: int | None = None) -> tuple[str, bool]:
+    effective_limit = limit if limit is not None else _max_pair_chars()
     clean = (text or "").strip()
-    if len(clean) <= limit:
+    if len(clean) <= effective_limit:
         return clean, False
-    head = max(200, limit // 2)
-    tail = max(120, limit - head - 32)
-    excerpt = f"{clean[:head].rstrip()}\n[…texto truncado…]\n{clean[-tail:].lstrip()}"
+    half = effective_limit // 2
+    head = max(1, half - 16)
+    tail = max(1, effective_limit - head - 32)
+    excerpt = f"{clean[:head].rstrip()}\n[...texto truncado...]\n{clean[-tail:].lstrip()}"
     return excerpt, True
+
+
+def _build_display_segments(text_a: str, text_b: str) -> tuple[list[DiffSegment], list[DiffSegment]]:
+    a = (text_a or "").strip()
+    b = (text_b or "").strip()
+    if not a and not b:
+        return [], []
+    if not a:
+        return [], [DiffSegment(type="insert", text=b)]
+    if not b:
+        return [DiffSegment(type="delete", text=a)], []
+    words_a = re.split(r"(\s+)", a)
+    words_b = re.split(r"(\s+)", b)
+    sm = SequenceMatcher(a=words_a, b=words_b, autojunk=False)
+    segs_a: list[DiffSegment] = []
+    segs_b: list[DiffSegment] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        chunk_a = "".join(words_a[i1:i2])
+        chunk_b = "".join(words_b[j1:j2])
+        if tag == "equal":
+            if chunk_a:
+                segs_a.append(DiffSegment(type="equal", text=chunk_a))
+            if chunk_b:
+                segs_b.append(DiffSegment(type="equal", text=chunk_b))
+        elif tag == "replace":
+            if chunk_a:
+                segs_a.append(DiffSegment(type="delete", text=chunk_a))
+            if chunk_b:
+                segs_b.append(DiffSegment(type="insert", text=chunk_b))
+        elif tag == "delete":
+            if chunk_a:
+                segs_a.append(DiffSegment(type="delete", text=chunk_a))
+        elif tag == "insert":
+            if chunk_b:
+                segs_b.append(DiffSegment(type="insert", text=chunk_b))
+    return segs_a, segs_b
 
 
 def _pair_text(blocks: list[TextBlock]) -> str:
@@ -514,9 +504,7 @@ def _heuristic_compare_pair(
         return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
     lexical_overlap = _token_overlap_score(norm_a, norm_b)
     semantic_similarity = _text_similarity(norm_a, norm_b)
-    if lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD and semantic_similarity >= (SEMANTIC_EQUALITY_THRESHOLD - 0.03):
-        return LLMComparisonResponse.model_validate({"changes": []}), "format_noise_equivalent"
-    if semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD and _relative_length_score(norm_a, norm_b) >= 0.9:
+    if lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD and semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD:
         return LLMComparisonResponse.model_validate({"changes": []}), "format_noise_equivalent"
     return None
 
@@ -705,7 +693,6 @@ def compare_documents(
         failed_blocks = 0
         fallback_blocks = 0
         cache_hits = 0
-        llm_pairs = 0
         llm_pair_cache: dict[str, LLMComparisonResponse] = {}
         llm_generated_rows = 0
         fallback_generated_rows = 0
@@ -754,7 +741,6 @@ def compare_documents(
                         )
                         llm_pair_cache[cache_key] = llm_response
                         row_source = "llm"
-                        llm_pairs += 1
                     except Exception as exc:  # noqa: BLE001
                         if isinstance(exc, LLMResponseError):
                             fallback_blocks += 1
@@ -797,19 +783,31 @@ def compare_documents(
                 }
             )
             for change in llm_response.changes:
+                segs_a, segs_b = _build_display_segments(pair_text_a, pair_text_b)
+                _is_llm = row_source == "llm"
+                _is_cache = row_source == "cache"
+                _is_fallback = row_source == "fallback"
                 rows.append(
                     ChangeRow(
                         block_id=len(rows) + 1,
                         pair_id=pair_id,
                         text_a=change.source_a,
                         text_b=change.source_b,
-                        display_text_a=change.source_a or pair_text_a,
-                        display_text_b=change.source_b or pair_text_b,
+                        display_text_a=pair_text_a,
+                        display_text_b=pair_text_b,
+                        display_segments_a=segs_a,
+                        display_segments_b=segs_b,
                         change_type=change.change_type,
                         confidence=change.confidence,
                         severity=change.severity,
                         summary=change.summary,
                         llm_comment=change.evidence,
+                        result_origin=row_source,
+                        llm_success=_is_llm or _is_cache,
+                        cache_hit=_is_cache,
+                        fallback_applied=_is_fallback,
+                        decision_source=row_source,
+                        model_name=settings.llm_model if (_is_llm or _is_cache) else "local",
                         chunk_index_a=-1 if block_a is None else min(indices_a),
                         chunk_index_b=-1 if block_b is None else min(indices_b),
                         offset_start_a=0 if not pair_blocks_a else min(block.start_char for block in pair_blocks_a),
@@ -971,10 +969,6 @@ def compare_documents(
                     **pairing_counts,
                 },
                 "diagnostics": {
-                    "counts": {
-                        "pairs_sent_to_llm": llm_pairs,
-                        "final_review_actions": 0,
-                    },
                     "failed_blocks": failed_blocks,
                     "fallback_blocks": fallback_blocks,
                     "compared_pairs": compared_pairs,

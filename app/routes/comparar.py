@@ -205,6 +205,11 @@ def progress(sid: str) -> dict[str, object]:
     }
 
 
+@router.get("/resultado/{sid}")
+def resultado_alias(sid: str, offset: int = 0, limit: int | None = None) -> dict[str, object]:
+    return resultado_json(sid=sid, offset=offset, limit=limit)
+
+
 @router.get("/resultado/{sid}/json")
 def resultado_json(sid: str, offset: int = 0, limit: int | None = None) -> dict[str, object]:
     payload = load_job_result(sid)

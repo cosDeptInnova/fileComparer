@@ -8,6 +8,11 @@ from pydantic import BaseModel, Field
 ChangeType = Literal["añadido", "eliminado", "modificado"]
 
 
+class DiffSegment(BaseModel):
+    type: Literal["equal", "insert", "delete", "replace"] = "equal"
+    text: str = ""
+
+
 class ChangeRow(BaseModel):
     block_id: int
     pair_id: str
@@ -15,6 +20,8 @@ class ChangeRow(BaseModel):
     text_b: str = ""
     display_text_a: str = ""
     display_text_b: str = ""
+    display_segments_a: list[DiffSegment] = Field(default_factory=list)
+    display_segments_b: list[DiffSegment] = Field(default_factory=list)
     change_type: ChangeType
     confidence: str = "media"
     severity: str = "media"
@@ -26,6 +33,12 @@ class ChangeRow(BaseModel):
     offset_end_a: int = 0
     offset_start_b: int = 0
     offset_end_b: int = 0
+    result_origin: str = ""
+    llm_success: bool = False
+    cache_hit: bool = False
+    fallback_applied: bool = False
+    decision_source: str = ""
+    model_name: str = ""
     related_block_ids: list[int] = Field(default_factory=list)
     pairing: dict[str, Any] = Field(default_factory=dict)
     source_spans: dict[str, Any] = Field(default_factory=dict)

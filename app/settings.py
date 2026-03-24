@@ -71,7 +71,7 @@ class Settings:
     worker_reclaim_interval_seconds: float = _env_float("COMPARE_WORKER_RECLAIM_INTERVAL_SECONDS", default=30.0)
     queue_max_job_attempts: int = _env_int("COMPARE_QUEUE_MAX_JOB_ATTEMPTS", default=3)
     max_file_mb: int = _env_int("COMPARE_MAX_FILE_MB", "TEXT_COMPARE_MAX_FILE_MB", default=40)
-    block_target_chars: int = _env_int("COMPARE_BLOCK_TARGET_CHARS", default=1400)
+    block_target_chars: int = _env_int("COMPARE_BLOCK_TARGET_CHARS", default=550)
     block_overlap_chars: int = _env_int("COMPARE_BLOCK_OVERLAP_CHARS", default=220)
     compare_pair_chars: int = _env_int("COMPARE_PAIR_CHARS", default=250)
     context_window_tokens: int = _env_int("COMPARE_CONTEXT_WINDOW_TOKENS", "COMPARE_CONTEXT_WINDOW_CHARS", default=20000)

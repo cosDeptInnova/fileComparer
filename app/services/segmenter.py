@@ -10,9 +10,9 @@ NUMBERING_ONLY_SEGMENT_RE = re.compile(
 HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+){0,3}\s+)?[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 ,:;()/-]{4,}$")
 SHORT_SEGMENT_JOIN_THRESHOLD = 10
 WORD_RE = re.compile(r"\S+")
-WORDS_PER_BLOCK_MIN = 250
-WORDS_PER_BLOCK_MAX = 300
-LONG_UNIT_WORD_LIMIT = 320
+WORDS_PER_BLOCK_MIN = 80
+WORDS_PER_BLOCK_MAX = 120
+LONG_UNIT_WORD_LIMIT = 140
 
 
 @dataclass(slots=True)
