@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-SENTENCE_RE = re.compile(r"(?<=[.!?;:])\s+(?=[A-ZÁÉÍÓÚÑ0-9])")
+SENTENCE_RE = re.compile(r"(?<=[.!?;:])\s+")
 NUMBERING_ONLY_SEGMENT_RE = re.compile(
     r"(?i)^(?:[ivxlcdm]+[\)\.]|\(?\d+(?:\.\d+)*[\)\.]|[a-z]\))$"
 )
+HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+){0,3}\s+)?[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 ,:;()/-]{4,}$")
 SHORT_SEGMENT_JOIN_THRESHOLD = 10
 WORD_RE = re.compile(r"\S+")
 WORDS_PER_BLOCK_MIN = 250
@@ -31,11 +32,26 @@ def sentence_segments(text: str) -> list[str]:
     segments: list[str] = []
     source_segments = paragraph_chunks if paragraph_chunks else [cleaned]
     for source in source_segments:
-        pieces = [piece.strip() for piece in SENTENCE_RE.split(source) if piece.strip()]
-        if len(pieces) <= 1:
-            pieces = [segment.strip() for segment in re.split(r"\n+", source) if segment.strip()]
+        pieces = _paragraph_pieces(source)
         segments.extend(_merge_short_prefix_segments(pieces))
     return segments
+
+
+def _paragraph_pieces(source: str) -> list[str]:
+    lines = [line.strip() for line in re.split(r"\n+", source) if line.strip()]
+    if not lines:
+        return []
+    pieces: list[str] = []
+    for line in lines:
+        if NUMBERING_ONLY_SEGMENT_RE.fullmatch(line):
+            continue
+        if HEADING_RE.match(line):
+            pieces.append(line)
+            continue
+        sentence_like = [piece.strip() for piece in SENTENCE_RE.split(line) if piece.strip()]
+        if sentence_like:
+            pieces.extend(sentence_like)
+    return pieces
 
 
 def _merge_short_prefix_segments(segments: list[str]) -> list[str]:
