@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -445,6 +446,34 @@ def _pair_text(blocks: list[TextBlock]) -> str:
     return " ".join(block.text.strip() for block in blocks if block.text.strip()).strip()
 
 
+def _aggressive_canonical_text(text: str) -> str:
+    raw = unicodedata.normalize("NFKD", (text or "").lower())
+    no_diacritics = "".join(char for char in raw if not unicodedata.combining(char))
+    letters_and_numbers = re.sub(r"[^\w\s]", " ", no_diacritics)
+    return re.sub(r"\s+", " ", letters_and_numbers).strip()
+
+
+def _is_noise_equivalent(text_a: str, text_b: str) -> bool:
+    normalized_a = normalize_text(text_a)
+    normalized_b = normalize_text(text_b)
+    if normalized_a == normalized_b:
+        return True
+    canonical_a = _aggressive_canonical_text(normalized_a)
+    canonical_b = _aggressive_canonical_text(normalized_b)
+    if not canonical_a or not canonical_b:
+        return not canonical_a and not canonical_b
+    if canonical_a == canonical_b:
+        return True
+    lexical_overlap = _token_overlap_score(canonical_a, canonical_b)
+    semantic_similarity = _text_similarity(canonical_a, canonical_b)
+    length_score = _relative_length_score(canonical_a, canonical_b)
+    return (
+        lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD
+        and semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD
+        and length_score >= 0.96
+    )
+
+
 def _heuristic_compare_pair(
     block_a: TextBlock | None,
     block_b: TextBlock | None,
@@ -498,14 +527,8 @@ def _heuristic_compare_pair(
             ),
             "orphan_a",
         )
-    norm_a = normalize_text(text_a)
-    norm_b = normalize_text(text_b)
-    if norm_a == norm_b:
+    if _is_noise_equivalent(text_a, text_b):
         return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
-    lexical_overlap = _token_overlap_score(norm_a, norm_b)
-    semantic_similarity = _text_similarity(norm_a, norm_b)
-    if lexical_overlap >= NOISE_EQUIVALENCE_THRESHOLD and semantic_similarity >= SEMANTIC_EQUALITY_THRESHOLD:
-        return LLMComparisonResponse.model_validate({"changes": []}), "format_noise_equivalent"
     return None
 
 
@@ -518,11 +541,7 @@ def _llm_fallback_compare_pair(
 ) -> LLMComparisonResponse:
     text_a = (text_a if text_a is not None else ("" if block_a is None else block_a.text)).strip()
     text_b = (text_b if text_b is not None else ("" if block_b is None else block_b.text)).strip()
-    norm_a = normalize_text(text_a)
-    norm_b = normalize_text(text_b)
-    if norm_a == norm_b:
-        return LLMComparisonResponse.model_validate({"changes": []})
-    if _text_similarity(norm_a, norm_b) >= SEMANTIC_EQUALITY_THRESHOLD:
+    if _is_noise_equivalent(text_a, text_b):
         return LLMComparisonResponse.model_validate({"changes": []})
     change_type = "modificado"
     if not text_a and text_b:
