@@ -100,6 +100,36 @@ function flattenSegmentsText(segments = []) {
     .join("");
 }
 
+function normalizeRowKeyValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function deduplicateRowsForRender(rows = []) {
+  const unique = new Map();
+  rows.forEach((row) => {
+    const key = [
+      normalizeRowKeyValue(row.change_type),
+      normalizeRowKeyValue(row.text_a || row.display_text_a),
+      normalizeRowKeyValue(row.text_b || row.display_text_b),
+    ].join("||");
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, row);
+      return;
+    }
+    if (String(row.summary || "").length > String(existing.summary || "").length) {
+      unique.set(key, row);
+    }
+  });
+  return Array.from(unique.values()).map((row, index) => ({
+    ...row,
+    block_id: index + 1,
+  }));
+}
+
 function textContainsQuery(row, query) {
   if (!query) return true;
   const haystack = [
@@ -756,16 +786,16 @@ export default function TextCompareMainPanel({ isDarkMode }) {
         return null;
       }
       setResult((prev) => {
-        if (!append || !prev) return payload;
-        const mergedRows = [...(prev.rows || []), ...payload.rows].reduce(
-          (acc, row) => {
-            if (!acc.some((item) => item.block_id === row.block_id)) {
-              acc.push(row);
-            }
-            return acc;
-          },
-          [],
-        );
+        if (!append || !prev) {
+          return {
+            ...payload,
+            rows: deduplicateRowsForRender(payload.rows || []),
+          };
+        }
+        const mergedRows = deduplicateRowsForRender([
+          ...(prev.rows || []),
+          ...payload.rows,
+        ]);
         return {
           ...payload,
           rows: mergedRows,

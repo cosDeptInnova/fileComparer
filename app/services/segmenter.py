@@ -100,12 +100,12 @@ def _target_word_budget(target_chars: int) -> tuple[int, int]:
 
 
 def build_blocks(text: str, target_chars: int, overlap_chars: int) -> list[TextBlock]:
-    del overlap_chars
     units = sentence_segments(text)
     if not units:
         return []
 
     min_words, max_words = _target_word_budget(target_chars)
+    overlap_word_target = max(0, round(max(0, overlap_chars) / 5))
     normalized_units: list[tuple[str, int, int, int]] = []
     cursor = 0
     for unit in units:
@@ -142,6 +142,18 @@ def build_blocks(text: str, target_chars: int, overlap_chars: int) -> list[TextB
         block_text = " ".join(collected).strip()
         blocks.append(TextBlock(index=idx, text=block_text, start_char=start_char, end_char=end_char))
         idx += 1
-        pointer = next_pointer
+        if overlap_word_target <= 0:
+            pointer = next_pointer
+            continue
+
+        overlap_words = 0
+        overlap_units = 0
+        rewind_pointer = next_pointer - 1
+        while rewind_pointer >= pointer and overlap_words < overlap_word_target:
+            overlap_words += normalized_units[rewind_pointer][3]
+            overlap_units += 1
+            rewind_pointer -= 1
+
+        pointer = max(pointer + 1, next_pointer - overlap_units)
 
     return blocks
