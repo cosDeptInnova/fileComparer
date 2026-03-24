@@ -127,3 +127,42 @@ def test_extract_json_message_accepts_escaped_json_string_payload():
     data = _extract_json_message(payload)
 
     assert data["changes"][0]["change_type"] == "modificado"
+
+
+def test_llm_client_compare_normalizes_english_keys_and_labels():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"rows":[{"type":"added","a":"","b":"nuevo","description":"alta","confidence":"high","severity":"critical"}]}'
+                }
+            }
+        ]
+    }
+    client = LLMClient(client=FakeHttpClient(payload))
+
+    result = client.compare([
+        {"role": "system", "content": "x"},
+        {"role": "user", "content": "y"},
+    ])
+
+    assert result.changes[0].change_type == "añadido"
+    assert result.changes[0].source_b == "nuevo"
+    assert result.changes[0].confidence == "alta"
+    assert result.changes[0].severity == "critica"
+
+
+def test_extract_json_message_accepts_trailing_comma():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"changes":[{"change_type":"modificado","source_a":"A","source_b":"B",}],}'
+                }
+            }
+        ]
+    }
+
+    data = _extract_json_message(payload)
+
+    assert data["changes"][0]["change_type"] == "modificado"

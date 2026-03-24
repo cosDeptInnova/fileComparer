@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from ast import literal_eval
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,7 +100,7 @@ class LLMClient:
                     )
                     response = self._http_client().post("chat/completions", json=payload)
                     response.raise_for_status()
-                    parsed = _extract_json_message(response.json())
+                    parsed = _normalize_llm_payload(_extract_json_message(response.json()))
                     return LLMComparisonResponse.model_validate(parsed)
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
@@ -162,6 +163,47 @@ def _extract_json_message(payload: dict[str, Any]) -> dict[str, Any]:
         if parsed is not None:
             return parsed
     raise LLMResponseError(STRICT_JSON_ERROR)
+
+
+def _normalize_llm_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"changes": []}
+    rows = payload.get("changes")
+    if rows is None:
+        for alias in ("rows", "diffs", "results", "items"):
+            maybe = payload.get(alias)
+            if isinstance(maybe, list):
+                rows = maybe
+                break
+    if not isinstance(rows, list):
+        return {"changes": []}
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        change_type = _normalize_change_type(
+            row.get("change_type")
+            or row.get("type")
+            or row.get("action")
+            or row.get("kind")
+            or row.get("change")
+        )
+        if change_type is None:
+            continue
+        normalized_rows.append(
+            {
+                "change_type": change_type,
+                "source_a": str(row.get("source_a") or row.get("text_a") or row.get("a") or row.get("before") or ""),
+                "source_b": str(row.get("source_b") or row.get("text_b") or row.get("b") or row.get("after") or ""),
+                "summary": str(row.get("summary") or row.get("resumen") or row.get("description") or ""),
+                "confidence": _normalize_confidence_level(row.get("confidence")),
+                "severity": _normalize_severity_level(row.get("severity")),
+                "evidence": str(row.get("evidence") or row.get("comment") or row.get("reason") or ""),
+                "anchor_a": _normalize_optional_int(row.get("anchor_a") or row.get("index_a")),
+                "anchor_b": _normalize_optional_int(row.get("anchor_b") or row.get("index_b")),
+            }
+        )
+    return {"changes": normalized_rows}
 
 
 
@@ -279,7 +321,7 @@ def _parse_json_candidate(candidate: str) -> dict[str, Any] | None:
     if not normalized:
         return None
 
-    variants = [normalized]
+    variants = [normalized, _repair_common_json_issues(normalized)]
     if normalized.startswith('"') and normalized.endswith('"'):
         variants.append(normalized[1:-1])
     variants.append(normalized.replace('\\"', '"'))
@@ -291,7 +333,9 @@ def _parse_json_candidate(candidate: str) -> dict[str, Any] | None:
         try:
             data = json.loads(current)
         except Exception:
-            continue
+            data = _parse_pythonic_dict(current)
+            if data is None:
+                continue
         if isinstance(data, str):
             try:
                 data = json.loads(data)
@@ -300,3 +344,91 @@ def _parse_json_candidate(candidate: str) -> dict[str, Any] | None:
         if isinstance(data, dict):
             return data
     return None
+
+
+def _repair_common_json_issues(candidate: str) -> str:
+    fixed = (candidate or "").strip()
+    if not fixed:
+        return fixed
+    fixed = fixed.replace("“", '"').replace("”", '"').replace("’", "'")
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+    return fixed
+
+
+def _parse_pythonic_dict(candidate: str) -> dict[str, Any] | None:
+    current = (candidate or "").strip()
+    if not current:
+        return None
+    if not (current.startswith("{") and current.endswith("}")):
+        return None
+    try:
+        data = literal_eval(current)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _normalize_change_type(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    mapping = {
+        "añadido": "añadido",
+        "adicionado": "añadido",
+        "agregado": "añadido",
+        "insertado": "añadido",
+        "added": "añadido",
+        "addition": "añadido",
+        "new": "añadido",
+        "eliminado": "eliminado",
+        "borrado": "eliminado",
+        "removido": "eliminado",
+        "deleted": "eliminado",
+        "removed": "eliminado",
+        "deletion": "eliminado",
+        "modificado": "modificado",
+        "cambiado": "modificado",
+        "actualizado": "modificado",
+        "updated": "modificado",
+        "changed": "modificado",
+        "modified": "modificado",
+    }
+    return mapping.get(normalized)
+
+
+def _normalize_confidence_level(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    mapping = {
+        "baja": "baja",
+        "low": "baja",
+        "media": "media",
+        "medium": "media",
+        "alta": "alta",
+        "high": "alta",
+    }
+    return mapping.get(normalized, "media")
+
+
+def _normalize_severity_level(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    mapping = {
+        "baja": "baja",
+        "low": "baja",
+        "media": "media",
+        "medium": "media",
+        "alta": "alta",
+        "high": "alta",
+        "critica": "critica",
+        "crítica": "critica",
+        "critical": "critica",
+    }
+    return mapping.get(normalized, "media")
+
+
+def _normalize_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
