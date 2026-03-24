@@ -1,21 +1,44 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import re
 
 from app.schemas import ChangeRow, LLMComparisonResponse
+
+
+def _canonical_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_nested_duplicate(base: ChangeRow, candidate: ChangeRow) -> bool:
+    if base.change_type != candidate.change_type:
+        return False
+    base_a = _canonical_text(base.display_text_a)
+    base_b = _canonical_text(base.display_text_b)
+    cand_a = _canonical_text(candidate.display_text_a)
+    cand_b = _canonical_text(candidate.display_text_b)
+    if not base_a and not base_b:
+        return False
+    return (cand_a in base_a and cand_b in base_b) or (base_a in cand_a and base_b in cand_b)
 
 
 def deduplicate_rows(rows: list[ChangeRow]) -> list[ChangeRow]:
     unique: OrderedDict[tuple[str, str, str], ChangeRow] = OrderedDict()
     for row in rows:
-        key = (row.change_type, row.display_text_a.strip(), row.display_text_b.strip())
+        key = (row.change_type, _canonical_text(row.display_text_a), _canonical_text(row.display_text_b))
         if key not in unique:
             unique[key] = row
             continue
         existing = unique[key]
         if len(row.summary) > len(existing.summary):
             unique[key] = row
-    return list(unique.values())
+    deduped = list(unique.values())
+    filtered: list[ChangeRow] = []
+    for row in deduped:
+        if any(_is_nested_duplicate(existing, row) for existing in filtered):
+            continue
+        filtered.append(row)
+    return filtered
 
 
 def build_reconciliation_payload(rows: list[ChangeRow]) -> list[dict[str, object]]:

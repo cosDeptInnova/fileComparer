@@ -11,6 +11,9 @@ BULLET_RE = re.compile(
 )
 PAGE_LABEL_RE = re.compile(r"(?im)^\s*(?:page|página|pagina|hoja)\s+\d+\s*$")
 OCR_NOISE_RE = re.compile(r"(?m)^[^\w\n]{3,}$")
+SOFT_HYPHEN_RE = re.compile("\u00ad")
+MULTI_PUNCT_RE = re.compile(r"([,.;:])\1+")
+MULTI_DASH_RE = re.compile(r"[–—]{2,}")
 SENTENCE_SPACE_RE = re.compile(r"\s+([,.;:])")
 NUMBERING_ONLY_LINE_RE = re.compile(
     r"(?im)^\s*(?:[ivxlcdm]+[\)\.]|\(?\d+(?:\.\d+)*[\)\.]|[a-z]\))\s*$"
@@ -30,6 +33,7 @@ def _drop_repeated_edge_lines(lines: list[str]) -> list[str]:
 def normalize_text(raw_text: str) -> str:
     text = raw_text or ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = SOFT_HYPHEN_RE.sub("", text)
     text = LINE_BREAK_HYPHEN_RE.sub(r"\1\2", text)
     text = MULTI_NEWLINE_RE.sub(f"\n{PARAGRAPH_BREAK_TOKEN}\n", text)
     text = NUMBERING_ONLY_LINE_RE.sub("", text)
@@ -44,6 +48,8 @@ def normalize_text(raw_text: str) -> str:
     text = re.sub(r"(?<=\w)\n(?=\w)", " ", text)
     text = text.replace("\n", " ")
     text = text.replace(PARAGRAPH_BREAK_TOKEN, "\n\n")
+    text = MULTI_DASH_RE.sub("-", text)
+    text = MULTI_PUNCT_RE.sub(r"\1", text)
     text = SENTENCE_SPACE_RE.sub(r"\1", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"[ \t]*\n\n[ \t]*", "\n\n", text)
