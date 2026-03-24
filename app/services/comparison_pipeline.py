@@ -286,9 +286,6 @@ def _heuristic_compare_pair(block_a: TextBlock | None, block_b: TextBlock | None
         )
     if normalize_text(text_a) == normalize_text(text_b):
         return LLMComparisonResponse.model_validate({"changes": []}), "normalized_equal"
-    similarity = _token_overlap_score(text_a, text_b)
-    if similarity >= 0.985 and _relative_length_score(text_a, text_b) >= 0.96:
-        return LLMComparisonResponse.model_validate({"changes": []}), "high_similarity_equal"
     return None
 
 
