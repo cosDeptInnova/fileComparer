@@ -18,14 +18,14 @@ from app.settings import settings
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-PAIRING_ALGORITHM = "fixed_size_pairing"
+PAIRING_ALGORITHM = "semantic_dp_pairing_v2"
 MATCH_REWARD_BASELINE = 0.45
 GAP_PENALTY = 0.35
 MERGE_PENALTY = 0.18
 ANCHOR_SIMILARITY_THRESHOLD = 0.72
 SEMANTIC_EQUALITY_THRESHOLD = 0.93
 NOISE_EQUIVALENCE_THRESHOLD = 0.84
-MIN_MATCH_SIMILARITY = 0.72
+MIN_MATCH_SIMILARITY = 0.58
 
 
 @dataclass(slots=True)
@@ -637,9 +637,9 @@ def compare_documents(
     try:
         prepared_a = prepare_document(path_a, extraction=extraction)
         prepared_b = prepare_document(path_b, extraction=extraction)
-        chunks_a = _build_fixed_chunks(prepared_a.document.clean_text, settings.compare_pair_chars)
-        chunks_b = _build_fixed_chunks(prepared_b.document.clean_text, settings.compare_pair_chars)
-        pairs = _pair_fixed_chunks(chunks_a, chunks_b)
+        blocks_a = prepared_a.segments or _build_fixed_chunks(prepared_a.document.clean_text, settings.compare_pair_chars)
+        blocks_b = prepared_b.segments or _build_fixed_chunks(prepared_b.document.clean_text, settings.compare_pair_chars)
+        pairs = _pair_blocks(blocks_a, blocks_b)
         failure_threshold = max(0, int(len(pairs) * settings.compare_failed_blocks_error_ratio)) if pairs else 0
         pairing_counts = {
             "matched_pairs": sum(1 for pair in pairs if pair["pair_type"] == "matched"),
@@ -900,13 +900,15 @@ def compare_documents(
                     "block_size_words": 0,
                     "block_overlap_words": 0,
                     "model_name": client.model_name,
-                    "comparison_mode": "llm_250_char_pairs",
+                    "comparison_mode": "llm_semantic_block_pairs",
                     "reconciliation_mode": "disabled",
                 },
                 "segmentation": {
-                    "pair_chars": settings.compare_pair_chars,
-                    "doc_a_blocks": len(chunks_a),
-                    "doc_b_blocks": len(chunks_b),
+                    "target_chars": settings.block_target_chars,
+                    "overlap_chars": settings.block_overlap_chars,
+                    "pair_chars_fallback": settings.compare_pair_chars,
+                    "doc_a_blocks": len(blocks_a),
+                    "doc_b_blocks": len(blocks_b),
                 },
                 "extraction": asdict(extraction),
                 "pairing": {
