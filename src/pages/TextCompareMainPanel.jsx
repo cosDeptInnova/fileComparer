@@ -156,6 +156,33 @@ function textContainsQuery(row, query) {
   return haystack.includes(query);
 }
 
+function buildProgressFacts(progress) {
+  const metrics = progress?.metrics && typeof progress.metrics === "object"
+    ? progress.metrics
+    : {};
+  const facts = [];
+  const completedPairs = Number(metrics.completed_pairs ?? progress?.completed_pairs);
+  const totalPairs = Number(metrics.total_pairs ?? progress?.total_pairs);
+  if (Number.isFinite(completedPairs) && Number.isFinite(totalPairs) && totalPairs > 0) {
+    facts.push(`Parejas: ${completedPairs}/${totalPairs}`);
+  }
+  const failedBlocks = Number(metrics.failed_blocks ?? progress?.failed_blocks);
+  if (Number.isFinite(failedBlocks) && failedBlocks > 0) {
+    facts.push(`Fallos: ${failedBlocks}`);
+  }
+  const fallbackBlocks = Number(metrics.fallback_blocks ?? progress?.fallback_blocks);
+  if (Number.isFinite(fallbackBlocks) && fallbackBlocks > 0) {
+    facts.push(`Fallback local: ${fallbackBlocks}`);
+  }
+  if (metrics.phase) {
+    facts.push(`Fase: ${metrics.phase}`);
+  }
+  if (metrics.current_file) {
+    facts.push(`Documento: ${metrics.current_file}`);
+  }
+  return facts;
+}
+
 function ResultStatPill({ label, value, isDarkMode }) {
   return (
     <span
@@ -637,6 +664,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
     step: "—",
     detail: "",
     status: "idle",
+    metrics: {},
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [result, setResult] = useState(null);
@@ -747,7 +775,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
     setFileA(null);
     setFileB(null);
     setSid(null);
-    setProgress({ percent: 0, step: "—", detail: "", status: "idle" });
+    setProgress({ percent: 0, step: "—", detail: "", status: "idle", metrics: {} });
     setIsSubmitting(false);
     setResult(null);
     setIsLoadingResult(false);
@@ -866,8 +894,9 @@ export default function TextCompareMainPanel({ isDarkMode }) {
       setProgress({
         percent: 5,
         step: "Empezando",
-        detail: "",
+        detail: "Job encolado. Esperando primer heartbeat del worker",
         status: "running",
+        metrics: { phase: "queued" },
       });
 
       stopPolling();
@@ -993,6 +1022,7 @@ export default function TextCompareMainPanel({ isDarkMode }) {
   const isTerminalSuccess = isTextCompareSuccessStatus(progress?.status);
   const isTerminalError = isTextCompareErrorStatus(progress?.status);
   const progressMetrics = progress?.metrics || {};
+  const progressFacts = buildProgressFacts(progress);
   const hasResult = Boolean(result);
   const showComparisonSetup = !hasResult && (!sid || isTerminalError);
   const showProgressPanel = sid && !hasResult && !isTerminalSuccess;
@@ -1338,6 +1368,20 @@ export default function TextCompareMainPanel({ isDarkMode }) {
                 }}
               />
             </div>
+            {progressFacts.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {progressFacts.map((fact) => (
+                  <span
+                    key={fact}
+                    className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                      isDarkMode ? "bg-gray-700 text-gray-100" : "bg-gray-200 text-gray-700"
+                    }`}
+                  >
+                    {fact}
+                  </span>
+                ))}
+              </div>
+            )}
             {isTerminalError && (
               <div
                 className={`mt-3 text-sm 2xl:text-base ${isDarkMode ? "text-red-300" : "text-red-700"}`}

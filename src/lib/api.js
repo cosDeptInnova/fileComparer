@@ -817,9 +817,21 @@ export async function startTextCompareJob({ fileA, fileB, options = {} }) {
  * GET /api/comparador/progress/{sid}
  */
 export async function pollTextCompareProgress(sid) {
-  return comparerFetch(`/progress/${encodeURIComponent(sid)}`, {
+  const payload = await comparerFetch(`/progress/${encodeURIComponent(sid)}`, {
     method: "GET",
   });
+  const metrics = payload?.metrics && typeof payload.metrics === "object"
+    ? payload.metrics
+    : {};
+  return {
+    sid: payload?.sid || sid,
+    status: String(payload?.status || "queued"),
+    percent: Number(payload?.percent ?? 0),
+    step: String(payload?.step || "pendiente"),
+    detail: String(payload?.detail || ""),
+    error: payload?.error || null,
+    metrics,
+  };
 }
 
 function normalizeTextCompareSegments(value = []) {

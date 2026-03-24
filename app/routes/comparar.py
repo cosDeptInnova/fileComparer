@@ -194,6 +194,9 @@ def progress(sid: str) -> dict[str, object]:
     state = read_job_state(sid)
     if not state:
         raise HTTPException(status_code=404, detail="Progreso no disponible o expirado")
+    state_metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+    failed_blocks = int(state.get("failed_blocks", 0) or 0)
+    total_pairs = int(state.get("total_pairs", 0) or 0)
     return {
         "sid": sid,
         "status": state.get("status", "queued"),
@@ -201,7 +204,12 @@ def progress(sid: str) -> dict[str, object]:
         "step": state.get("step", "pendiente"),
         "detail": state.get("detail", ""),
         "error": state.get("error"),
-        "metrics": {"queue": {"backend": "celery", "name": settings.compare_queue_name}},
+        "metrics": {
+            "queue": {"backend": "celery", "name": settings.compare_queue_name},
+            "failed_blocks": failed_blocks,
+            "total_pairs": total_pairs,
+            **state_metrics,
+        },
     }
 
 

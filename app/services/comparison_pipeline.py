@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import unicodedata
+from time import perf_counter
 from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +28,34 @@ ANCHOR_SIMILARITY_THRESHOLD = 0.72
 SEMANTIC_EQUALITY_THRESHOLD = 0.93
 NOISE_EQUIVALENCE_THRESHOLD = 0.84
 MIN_MATCH_SIMILARITY = 0.58
+
+
+def _emit_job_progress(
+    *,
+    sid: str,
+    percent: int,
+    step: str,
+    detail: str,
+    status: str = "running",
+    metrics: dict[str, Any] | None = None,
+    **extra_fields: Any,
+) -> None:
+    logger.info("[compare:%s] %s%% %s - %s", sid, percent, step, detail)
+    try:
+        from app.services.queue import update_job_state
+
+        payload: dict[str, Any] = {
+            "status": status,
+            "percent": max(0, min(100, int(percent))),
+            "step": step,
+            "detail": detail,
+        }
+        if metrics:
+            payload["metrics"] = metrics
+        payload.update(extra_fields)
+        update_job_state(sid, **payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudo actualizar progreso para %s: %s", sid, exc)
 
 
 @dataclass(slots=True)
@@ -86,6 +115,13 @@ def _block_similarity(block_a: TextBlock, block_b: TextBlock, total_a: int, tota
 
 def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None = None) -> PreparedDocument:
     extraction = extraction or ExtractionOptions()
+    source_path = Path(path)
+    logger.info(
+        "Extrayendo documento %s (engine=%s, drop_headers=%s)",
+        source_path.name,
+        extraction.engine,
+        extraction.drop_headers,
+    )
     extraction_result = extract_document_result(
         str(path),
         soffice_path=extraction.soffice_path,
@@ -95,6 +131,13 @@ def prepare_document(path: str | Path, *, extraction: ExtractionOptions | None =
     raw_text = extraction_result.text
     clean_text = normalize_text(raw_text)
     blocks = build_blocks(clean_text, settings.block_target_chars, settings.block_overlap_chars)
+    logger.info(
+        "Documento %s preparado: raw_chars=%s clean_chars=%s blocks=%s",
+        source_path.name,
+        len(raw_text),
+        len(clean_text),
+        len(blocks),
+    )
     quality_payload = extraction_result.to_quality_dict()
     metadata = {
         **dict(extraction_result.metadata),
@@ -672,6 +715,14 @@ def _persist_runtime_snapshot(
             percent=payload["progress"]["percent"],
             step=step,
             detail=detail,
+            metrics={
+                "phase": "comparison" if status == "running" else "completed",
+                "completed_pairs": compared_pairs,
+                "total_pairs": total_pairs,
+                "failed_blocks": failed_blocks,
+                "fallback_blocks": fallback_blocks,
+                "rows_count": len(visible_rows),
+            },
             partial_result=partial_result,
             failed_blocks=failed_blocks,
             total_pairs=total_pairs,
@@ -693,12 +744,51 @@ def compare_documents(
     owns_client = llm_client is None
     client = llm_client or LLMClient()
     extraction = extraction or ExtractionOptions()
+    started_at = perf_counter()
+    logger.info("Iniciando comparación sid=%s path_a=%s path_b=%s", sid, path_a, path_b)
     try:
+        _emit_job_progress(
+            sid=sid,
+            percent=20,
+            step="extrayendo",
+            detail="Extrayendo y normalizando Documento A",
+            metrics={"phase": "extraction", "current_file": "A"},
+        )
         prepared_a = prepare_document(path_a, extraction=extraction)
+        _emit_job_progress(
+            sid=sid,
+            percent=32,
+            step="extrayendo",
+            detail="Documento A procesado. Extrayendo Documento B",
+            metrics={
+                "phase": "extraction",
+                "current_file": "B",
+                "doc_a_blocks": len(prepared_a.segments),
+                "doc_a_chars": len(prepared_a.document.clean_text),
+            },
+        )
         prepared_b = prepare_document(path_b, extraction=extraction)
+        _emit_job_progress(
+            sid=sid,
+            percent=42,
+            step="segmentando",
+            detail="Emparejando bloques entre ambos documentos",
+            metrics={
+                "phase": "pairing",
+                "doc_a_blocks": len(prepared_a.segments),
+                "doc_b_blocks": len(prepared_b.segments),
+            },
+        )
         blocks_a = prepared_a.segments or _build_fixed_chunks(prepared_a.document.clean_text, settings.compare_pair_chars)
         blocks_b = prepared_b.segments or _build_fixed_chunks(prepared_b.document.clean_text, settings.compare_pair_chars)
         pairs = _pair_blocks(blocks_a, blocks_b)
+        logger.info(
+            "Emparejamiento completado sid=%s: blocks_a=%s blocks_b=%s pairs=%s",
+            sid,
+            len(blocks_a),
+            len(blocks_b),
+            len(pairs),
+        )
         failure_threshold = max(0, int(len(pairs) * settings.compare_failed_blocks_error_ratio)) if pairs else 0
         pairing_counts = {
             "matched_pairs": sum(1 for pair in pairs if pair["pair_type"] == "matched"),
@@ -746,6 +836,15 @@ def compare_documents(
                     cache_hits += 1
                 else:
                     try:
+                        logger.debug(
+                            "Invocando LLM sid=%s pair=%s/%s pair_id=%s pair_type=%s score=%.4f",
+                            sid,
+                            index,
+                            len(pairs),
+                            pair_id,
+                            pair["pair_type"],
+                            pair["alignment_score"],
+                        )
                         llm_response = client.compare(
                             _comparison_messages(
                                 block_a,
@@ -875,6 +974,10 @@ def compare_documents(
                 settings.compare_partial_persist_every_pairs > 0
                 and (index % max(1, settings.compare_partial_persist_every_pairs) == 0 or index == len(pairs))
             ):
+                compare_detail = (
+                    f"Pareja {index}/{len(pairs)} · cambios={len(rows)} · "
+                    f"fallback={fallback_blocks} · errores={failed_blocks}"
+                )
                 _persist_runtime_snapshot(
                     sid=sid,
                     rows=rows,
@@ -885,8 +988,9 @@ def compare_documents(
                     partial_result=fallback_blocks > 0 or failed_blocks > 0,
                     status="running",
                     step="comparando",
-                    detail="Comparando bloques y guardando resultados parciales",
+                    detail=compare_detail,
                 )
+                logger.info("[compare:%s] %s", sid, compare_detail)
         valid_rows_for_reconciliation = False
         reconciliation_used = False
         reconciliation_failed = False
@@ -922,6 +1026,32 @@ def compare_documents(
             warning_details.append(f"{fallback_blocks} bloques resueltos con fallback local")
         if reconciliation_failed:
             warning_details.append("reconciliación final no disponible")
+        total_ms = int((perf_counter() - started_at) * 1000)
+        logger.info(
+            "Comparación finalizada sid=%s status=%s rows=%s pairs=%s failed=%s fallback=%s duration_ms=%s",
+            sid,
+            status,
+            len(final_rows),
+            len(pairs),
+            failed_blocks,
+            fallback_blocks,
+            total_ms,
+        )
+        _emit_job_progress(
+            sid=sid,
+            percent=100,
+            step="completado" if status != "error" else "completado_con_errores",
+            detail="Comparación finalizada" if status == "done" else "Comparación finalizada con advertencias",
+            status=status,
+            metrics={
+                "phase": "completed",
+                "completed_pairs": compared_pairs,
+                "total_pairs": len(pairs),
+                "failed_blocks": failed_blocks,
+                "fallback_blocks": fallback_blocks,
+                "duration_ms": total_ms,
+            },
+        )
         return ComparisonResult(
             sid=sid,
             status=status,
@@ -1006,6 +1136,7 @@ def compare_documents(
                     "deduplicated_rows": deduplicated_count,
                     "pairing_debug": pairing_debug,
                     "errors": diagnostics_errors,
+                    "duration_ms": total_ms,
                 },
                 "partial_result": partial_result,
                 "error_summary": error_summary,
