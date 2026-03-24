@@ -73,6 +73,7 @@ class Settings:
     max_file_mb: int = _env_int("COMPARE_MAX_FILE_MB", "TEXT_COMPARE_MAX_FILE_MB", default=40)
     block_target_chars: int = _env_int("COMPARE_BLOCK_TARGET_CHARS", default=1400)
     block_overlap_chars: int = _env_int("COMPARE_BLOCK_OVERLAP_CHARS", default=220)
+    compare_pair_chars: int = _env_int("COMPARE_PAIR_CHARS", default=250)
     context_window_tokens: int = _env_int("COMPARE_CONTEXT_WINDOW_TOKENS", "COMPARE_CONTEXT_WINDOW_CHARS", default=20000)
     llm_base_url: str = _env(
         "LLAMA_CPP_BASE_URL",
