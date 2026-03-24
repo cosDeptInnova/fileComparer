@@ -817,9 +817,21 @@ export async function startTextCompareJob({ fileA, fileB, options = {} }) {
  * GET /api/comparador/progress/{sid}
  */
 export async function pollTextCompareProgress(sid) {
-  return comparerFetch(`/progress/${encodeURIComponent(sid)}`, {
+  const payload = await comparerFetch(`/progress/${encodeURIComponent(sid)}`, {
     method: "GET",
   });
+  const metrics = payload?.metrics && typeof payload.metrics === "object"
+    ? payload.metrics
+    : {};
+  return {
+    sid: payload?.sid || sid,
+    status: String(payload?.status || "queued"),
+    percent: Number(payload?.percent ?? 0),
+    step: String(payload?.step || "pendiente"),
+    detail: String(payload?.detail || ""),
+    error: payload?.error || null,
+    metrics,
+  };
 }
 
 function normalizeTextCompareSegments(value = []) {
@@ -844,6 +856,41 @@ function normalizeTextCompareSegments(value = []) {
   }, []);
 }
 
+
+function canonicalRowValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function deduplicateTextCompareRows(rows = []) {
+  const unique = new Map();
+
+  rows.forEach((row) => {
+    const key = [
+      row.change_type,
+      canonicalRowValue(row.text_a || row.display_text_a),
+      canonicalRowValue(row.text_b || row.display_text_b),
+    ].join("||");
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, row);
+      return;
+    }
+    const existingSummaryLength = String(existing.summary || "").length;
+    const currentSummaryLength = String(row.summary || "").length;
+    if (currentSummaryLength > existingSummaryLength) {
+      unique.set(key, row);
+    }
+  });
+
+  return Array.from(unique.values()).map((row, index) => ({
+    ...row,
+    block_id: index + 1,
+  }));
+}
+
 export function normalizeTextCompareResultPayload(payload = {}) {
   const meta = payload?.meta || {};
   const pagination = meta?.pagination || {};
@@ -852,7 +899,7 @@ export function normalizeTextCompareResultPayload(payload = {}) {
   const pairing = meta?.pairing || {};
   const segmentation = meta?.segmentation || {};
   const rowFormation = meta?.row_formation || {};
-  const rows = Array.isArray(payload?.rows)
+  const normalizedRows = Array.isArray(payload?.rows)
     ? payload.rows.map((row) => ({
         block_id: Number.parseInt(row?.block_id, 10) || 0,
         pair_id: String(row?.pair_id || ""),
@@ -939,6 +986,7 @@ export function normalizeTextCompareResultPayload(payload = {}) {
         reanchored: Boolean(row?.reanchored),
       }))
     : [];
+  const rows = deduplicateTextCompareRows(normalizedRows);
 
   return {
     sid: payload?.sid || null,

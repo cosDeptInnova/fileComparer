@@ -24,12 +24,21 @@ def run_compare_job(
     engine: str = "auto",
     drop_headers: bool = True,
 ) -> dict[str, object]:
+    logger.info(
+        "Iniciando job de comparación sid=%s file_a=%s file_b=%s engine=%s drop_headers=%s",
+        sid,
+        path_a,
+        path_b,
+        engine,
+        drop_headers,
+    )
     update_job_state(
         sid,
         status="running",
         percent=20,
         step="extrayendo",
         detail="Extracción y normalización",
+        metrics={"phase": "extraction", "current_file": "A"},
     )
     try:
         result: ComparisonResult = compare_documents(
@@ -54,11 +63,28 @@ def run_compare_job(
             percent=int(progress.get("percent", 100)),
             step=str(progress.get("step", "completado")),
             detail=str(progress.get("detail", "Comparación finalizada")),
+            metrics={
+                "phase": "completed",
+                "rows_count": len(result.rows or []),
+                "duration_ms": diagnostics.get("duration_ms", None) if isinstance(diagnostics, dict) else None,
+                "failed_blocks": diagnostics.get("failed_blocks", 0) if isinstance(diagnostics, dict) else 0,
+                "fallback_blocks": diagnostics.get("fallback_blocks", 0) if isinstance(diagnostics, dict) else 0,
+                "total_pairs": diagnostics.get("total_pairs", 0) if isinstance(diagnostics, dict) else 0,
+                "completed_pairs": diagnostics.get("compared_pairs", 0) if isinstance(diagnostics, dict) else 0,
+            },
             partial_result=bool(result.meta.get("partial_result")),
             summary=error_summary,
             diagnostics=diagnostics,
             failed_blocks=diagnostics.get("failed_blocks", 0) if isinstance(diagnostics, dict) else 0,
             total_pairs=diagnostics.get("total_pairs", 0) if isinstance(diagnostics, dict) else 0,
+        )
+        logger.info(
+            "Job de comparación finalizado sid=%s status=%s rows=%s failed_blocks=%s fallback_blocks=%s",
+            sid,
+            result.status,
+            len(result.rows or []),
+            diagnostics.get("failed_blocks", 0) if isinstance(diagnostics, dict) else 0,
+            diagnostics.get("fallback_blocks", 0) if isinstance(diagnostics, dict) else 0,
         )
         return payload
     except Exception as exc:  # noqa: BLE001

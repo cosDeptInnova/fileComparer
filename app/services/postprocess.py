@@ -10,13 +10,17 @@ def _canonical_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def _row_text_pair(row: ChangeRow) -> tuple[str, str]:
+    source_a = row.text_a if (row.text_a or "").strip() else row.display_text_a
+    source_b = row.text_b if (row.text_b or "").strip() else row.display_text_b
+    return _canonical_text(source_a), _canonical_text(source_b)
+
+
 def _is_nested_duplicate(base: ChangeRow, candidate: ChangeRow) -> bool:
     if base.change_type != candidate.change_type:
         return False
-    base_a = _canonical_text(base.display_text_a)
-    base_b = _canonical_text(base.display_text_b)
-    cand_a = _canonical_text(candidate.display_text_a)
-    cand_b = _canonical_text(candidate.display_text_b)
+    base_a, base_b = _row_text_pair(base)
+    cand_a, cand_b = _row_text_pair(candidate)
     if not base_a and not base_b:
         return False
     return (cand_a in base_a and cand_b in base_b) or (base_a in cand_a and base_b in cand_b)
@@ -25,7 +29,8 @@ def _is_nested_duplicate(base: ChangeRow, candidate: ChangeRow) -> bool:
 def deduplicate_rows(rows: list[ChangeRow]) -> list[ChangeRow]:
     unique: OrderedDict[tuple[str, str, str], ChangeRow] = OrderedDict()
     for row in rows:
-        key = (row.change_type, _canonical_text(row.display_text_a), _canonical_text(row.display_text_b))
+        canonical_a, canonical_b = _row_text_pair(row)
+        key = (row.change_type, canonical_a, canonical_b)
         if key not in unique:
             unique[key] = row
             continue
