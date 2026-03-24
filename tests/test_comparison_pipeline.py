@@ -160,6 +160,15 @@ def test_pair_blocks_marks_reordered_sections_as_reanchored():
     ]
 
 
+def test_heuristic_compare_pair_does_not_short_circuit_high_similarity_texts():
+    block_a = make_block(0, "El proveedor entregará informe mensual con anexos y métricas de calidad.")
+    block_b = make_block(0, "El proveedor entregará informe mensual con anexos y métricas de calidad")
+
+    result = comparison_pipeline._heuristic_compare_pair(block_a, block_b)
+
+    assert result is None
+
+
 def test_compare_documents_reports_pairing_counters_and_row_pair_types(monkeypatch, tmp_path: Path):
     file_a = tmp_path / "a.txt"
     file_b = tmp_path / "b.txt"
